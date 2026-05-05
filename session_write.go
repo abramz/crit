@@ -33,16 +33,17 @@ func (s *Session) scheduleWrite() {
 	})
 }
 
-// critJSONPath returns the path to the review file.
+// critJSONPath returns the review identity path. In v4 the identity is a
+// folder containing review.json and snapshots.json — see reviewPathsFor.
 func (s *Session) critJSONPath() string {
 	if s.OutputDir != "" {
-		return filepath.Join(s.OutputDir, ".crit.json")
+		return filepath.Join(s.OutputDir, ".crit")
 	}
 	if s.ReviewFilePath != "" {
 		return s.ReviewFilePath
 	}
 	// Fallback for tests and backwards compat
-	return filepath.Join(s.RepoRoot, ".crit.json")
+	return filepath.Join(s.RepoRoot, ".crit")
 }
 
 // writeFilesSnapshot holds all session state needed to write the review file,
@@ -81,7 +82,7 @@ func (s *Session) handleExternalDeletion(critPath string) bool {
 	if lastMtime.IsZero() {
 		return false
 	}
-	if _, statErr := os.Stat(critPath); !os.IsNotExist(statErr) {
+	if _, statErr := os.Stat(reviewPathsFor(critPath).Review); !os.IsNotExist(statErr) {
 		return false
 	}
 
@@ -117,7 +118,7 @@ func (s *Session) clearAllCommentData() {
 // and merges per-file comments.
 func buildCritJSON(snap writeFilesSnapshot) CritJSON {
 	cj := CritJSON{Files: make(map[string]CritJSONFile)}
-	if data, err := os.ReadFile(snap.critPath); err == nil {
+	if data, err := os.ReadFile(reviewPathsFor(snap.critPath).Review); err == nil {
 		if unmarshalErr := json.Unmarshal(data, &cj); unmarshalErr != nil {
 			fmt.Fprintf(os.Stderr, "Warning: corrupt review file, starting fresh: %v\n", unmarshalErr)
 		}
@@ -202,8 +203,13 @@ func (s *Session) WriteFiles() {
 	snap := s.snapshotForWrite(critPath)
 	cj := buildCritJSON(snap)
 
+	paths := reviewPathsFor(snap.critPath)
 	if critJSONIsEmpty(cj) {
-		os.Remove(snap.critPath)
+		// B1: remove ONLY review.json. Snapshots are server-only state and
+		// may still be valid for the timeline; full-folder cleanup belongs to
+		// explicit cleanup paths (clearCritJSON, ClearAllComments,
+		// deleteStaleReviews, cleanupOnApproval).
+		os.Remove(paths.Review)
 		s.mu.Lock()
 		s.lastCritJSONMtime = time.Time{}
 		s.pendingWrite = false
@@ -217,11 +223,11 @@ func (s *Session) WriteFiles() {
 		fmt.Fprintf(os.Stderr, "Error marshaling review file: %v\n", err)
 		return
 	}
-	if err := atomicWriteFile(snap.critPath, data, 0644); err != nil {
+	if err := atomicWriteFile(paths.Review, data, 0644); err != nil {
 		fmt.Fprintf(os.Stderr, "Error writing review file: %v\n", err)
 		return
 	}
-	if info, err := os.Stat(snap.critPath); err == nil {
+	if info, err := os.Stat(paths.Review); err == nil {
 		s.mu.Lock()
 		s.lastCritJSONMtime = info.ModTime()
 		s.pendingWrite = false
@@ -325,6 +331,10 @@ func (s *Session) mergeCommentRepliesAndState(comments []Comment, dc Comment) bo
 			comments[i].Resolved = dc.Resolved
 			changed = true
 		}
+		if dc.ResolvedRound != mc.ResolvedRound {
+			comments[i].ResolvedRound = dc.ResolvedRound
+			changed = true
+		}
 		break
 	}
 	return changed
@@ -380,6 +390,10 @@ func (s *Session) mergeReviewCommentRepliesAndState(dc Comment) bool {
 			s.reviewComments[i].Resolved = dc.Resolved
 			changed = true
 		}
+		if dc.ResolvedRound != mc.ResolvedRound {
+			s.reviewComments[i].ResolvedRound = dc.ResolvedRound
+			changed = true
+		}
 		memRIDs := make(map[string]struct{}, len(mc.Replies))
 		for _, r := range mc.Replies {
 			memRIDs[r.ID] = struct{}{}
@@ -416,7 +430,7 @@ func (s *Session) filterDeletedReviewComments(diskComments []Comment) bool {
 func (s *Session) mergeExternalCritJSON() bool {
 	critPath := s.critJSONPath()
 
-	info, err := os.Stat(critPath)
+	info, err := os.Stat(reviewPathsFor(critPath).Review)
 
 	s.mu.RLock()
 	lastMtime := s.lastCritJSONMtime
@@ -440,7 +454,7 @@ func (s *Session) mergeExternalCritJSON() bool {
 		return false
 	}
 
-	data, err := os.ReadFile(critPath)
+	data, err := os.ReadFile(reviewPathsFor(critPath).Review)
 	if err != nil {
 		return false
 	}

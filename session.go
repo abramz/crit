@@ -57,7 +57,16 @@ type Reply struct {
 	Author    string `json:"author,omitempty"`
 	UserID    string `json:"user_id,omitempty"`
 	CreatedAt string `json:"created_at"`
-	GitHubID  int64  `json:"github_id,omitempty"`
+	// ReviewRound is the review round during which this reply was authored.
+	// Used by the per-round timeline to scope reply visibility independently
+	// of the parent comment. Legacy replies (no field set) are treated as
+	// belonging to the parent's ReviewRound — see commentsAtOrBeforeRound.
+	ReviewRound int `json:"review_round,omitempty"`
+	// ResolvedRound is the review round during which this reply was resolved
+	// (mirrors Comment.ResolvedRound). Currently set only via the parent
+	// comment's resolve transitions; reserved for future per-reply resolution.
+	ResolvedRound int   `json:"resolved_round,omitempty"`
+	GitHubID      int64 `json:"github_id,omitempty"`
 
 	// LastPushedBodyHash is a short stable digest of Body at the time of
 	// the most recent successful push (POST or PATCH) to GitHub. Used by
@@ -70,21 +79,27 @@ type Reply struct {
 
 // Comment represents a single inline review comment.
 type Comment struct {
-	ID             string  `json:"id"`
-	StartLine      int     `json:"start_line"`
-	EndLine        int     `json:"end_line"`
-	Side           string  `json:"side,omitempty"`
-	Body           string  `json:"body"`
-	Quote          string  `json:"quote,omitempty"`
-	QuoteOffset    *int    `json:"quote_offset,omitempty"`
-	Anchor         string  `json:"anchor,omitempty"`
-	Drifted        bool    `json:"drifted,omitempty"`
-	Author         string  `json:"author,omitempty"`
-	UserID         string  `json:"user_id,omitempty"`
-	Scope          string  `json:"scope,omitempty"`
-	CreatedAt      string  `json:"created_at"`
-	UpdatedAt      string  `json:"updated_at"`
-	Resolved       bool    `json:"resolved,omitempty"`
+	ID          string `json:"id"`
+	StartLine   int    `json:"start_line"`
+	EndLine     int    `json:"end_line"`
+	Side        string `json:"side,omitempty"`
+	Body        string `json:"body"`
+	Quote       string `json:"quote,omitempty"`
+	QuoteOffset *int   `json:"quote_offset,omitempty"`
+	Anchor      string `json:"anchor,omitempty"`
+	Drifted     bool   `json:"drifted,omitempty"`
+	Author      string `json:"author,omitempty"`
+	UserID      string `json:"user_id,omitempty"`
+	Scope       string `json:"scope,omitempty"`
+	CreatedAt   string `json:"created_at"`
+	UpdatedAt   string `json:"updated_at"`
+	Resolved    bool   `json:"resolved,omitempty"`
+	// ResolvedRound is the review round during which Resolved transitioned
+	// false -> true. Cleared to 0 when Resolved transitions back to false.
+	// Legacy comments lacking this field are treated as zero on read; the
+	// timeline visibility filter falls back to round 1 for legacy resolved
+	// comments (see commentsAtOrBeforeRound docs).
+	ResolvedRound  int     `json:"resolved_round,omitempty"`
 	Live           bool    `json:"live,omitempty"`
 	CarriedForward bool    `json:"carried_forward,omitempty"`
 	ReviewRound    int     `json:"review_round,omitempty"`
@@ -224,6 +239,20 @@ type Session struct {
 	IgnorePatterns []string
 
 	reviewComments []Comment
+
+	// RoundSnapshots is in-memory state populated from <folder>/snapshots.json
+	// at boot. Persisted via saveSnapshotsFile; never written into review.json.
+	//
+	// Lock contract: read/write under s.mu, EXCEPT during construction
+	// (NewSessionFromFiles, before SetSession) where the caller is the only
+	// goroutine that could observe it.
+	RoundSnapshots map[string]map[int]RoundSnapshot
+
+	// sessionStarted is set (atomically) by Server.SetSession to mark the
+	// transition from constructor-time (single-goroutine) to runtime
+	// (multi-goroutine). loadCritJSON checks this flag to enforce its
+	// pre-SetSession-only contract. 0 = pre-SetSession, 1 = post-SetSession.
+	sessionStarted atomic.Uint32
 
 	// deletedCommentIDs tracks IDs of file comments deleted in-memory but not
 	// yet written to disk. Keyed by file path -> set of comment IDs. This
@@ -571,7 +600,41 @@ func NewSessionFromFiles(paths []string, ignorePatterns []string) (*Session, err
 		s.Files = append(s.Files, fe)
 	}
 
+	s.captureBaselineAndPersist()
+
 	return s, nil
+}
+
+// captureBaselineAndPersist captures the R1 baseline (idempotent so resumed
+// sessions are unaffected) and best-effort writes the sidecar to disk.
+//
+// Skips the sidecar write when the identity would fall back to RepoRoot —
+// this path runs before applySessionOverrides has a chance to assign
+// ReviewFilePath / OutputDir. The first WriteFiles or round-complete will
+// re-emit the sidecar at the canonical centralized path.
+//
+// Pre-SetSession only — caller is the constructor and no concurrent readers
+// exist. See plan v4 §Lock discipline.
+func (s *Session) captureBaselineAndPersist() {
+	s.captureRoundSnapshot(s.ReviewRound)
+	if s.ReviewFilePath == "" && s.OutputDir == "" {
+		return
+	}
+	if len(s.RoundSnapshots) == 0 {
+		return
+	}
+	identity := s.critJSONPath()
+	// MIGRATION-REMOVAL: ensure folder layout up front so a stale flat
+	// review file doesn't fail the sidecar write below.
+	if err := ensureReviewFolder(identity); err != nil {
+		return
+	}
+	sidecar := reviewPathsFor(identity).Snapshots
+	if err := saveSnapshotsFile(sidecar, SnapshotsFile{
+		RoundSnapshots: cloneRoundSnapshots(s.RoundSnapshots),
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: write snapshots sidecar at construction: %v\n", err)
+	}
 }
 
 // walkDirectory recursively walks a directory and returns all file paths,
@@ -811,12 +874,19 @@ func (s *Session) DeleteReviewComment(id string) bool {
 }
 
 // ResolveReviewComment sets or clears the resolved flag on a review-level comment.
+// On a false -> true transition, ResolvedRound is stamped from s.ReviewRound.
+// On a true -> false transition, ResolvedRound is cleared to 0.
 func (s *Session) ResolveReviewComment(id string, resolved bool) (Comment, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for i, c := range s.reviewComments {
 		if c.ID == id {
 			s.reviewComments[i].Resolved = resolved
+			if resolved {
+				s.reviewComments[i].ResolvedRound = s.ReviewRound
+			} else {
+				s.reviewComments[i].ResolvedRound = 0
+			}
 			s.reviewComments[i].UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 			s.scheduleWrite()
 			return s.reviewComments[i], true
@@ -833,14 +903,16 @@ func (s *Session) AddReviewCommentReply(commentID, body, author, userID string) 
 		if c.ID == commentID {
 			now := time.Now().UTC().Format(time.RFC3339)
 			r := Reply{
-				ID:        randomReplyID(),
-				Body:      body,
-				Author:    author,
-				UserID:    userID,
-				CreatedAt: now,
+				ID:          randomReplyID(),
+				Body:        body,
+				Author:      author,
+				UserID:      userID,
+				CreatedAt:   now,
+				ReviewRound: s.ReviewRound,
 			}
 			s.reviewComments[i].Replies = append(s.reviewComments[i].Replies, r)
 			s.reviewComments[i].Resolved = false
+			s.reviewComments[i].ResolvedRound = 0
 			s.reviewComments[i].UpdatedAt = now
 			s.scheduleWrite()
 			return r, true
@@ -909,6 +981,8 @@ func (s *Session) UpdateComment(filePath, id, body string) (Comment, bool) {
 }
 
 // SetCommentResolved sets or clears the resolved flag on a comment.
+// On a false -> true transition, ResolvedRound is stamped from s.ReviewRound.
+// On a true -> false transition, ResolvedRound is cleared to 0.
 func (s *Session) SetCommentResolved(filePath, id string, resolved bool) (Comment, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -919,6 +993,11 @@ func (s *Session) SetCommentResolved(filePath, id string, resolved bool) (Commen
 	for i, c := range f.Comments {
 		if c.ID == id {
 			f.Comments[i].Resolved = resolved
+			if resolved {
+				f.Comments[i].ResolvedRound = s.ReviewRound
+			} else {
+				f.Comments[i].ResolvedRound = 0
+			}
 			f.Comments[i].UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 			s.scheduleWrite()
 			return f.Comments[i], true
@@ -1008,14 +1087,16 @@ func (s *Session) AddReply(filePath, commentID, body, author, userID string) (Re
 		if c.ID == commentID {
 			now := time.Now().UTC().Format(time.RFC3339)
 			r := Reply{
-				ID:        randomReplyID(),
-				Body:      body,
-				Author:    author,
-				UserID:    userID,
-				CreatedAt: now,
+				ID:          randomReplyID(),
+				Body:        body,
+				Author:      author,
+				UserID:      userID,
+				CreatedAt:   now,
+				ReviewRound: s.ReviewRound,
 			}
 			f.Comments[i].Replies = append(f.Comments[i].Replies, r)
 			f.Comments[i].Resolved = false
+			f.Comments[i].ResolvedRound = 0
 			f.Comments[i].UpdatedAt = now
 			s.scheduleWrite()
 			return r, true
@@ -1459,7 +1540,9 @@ func (s *Session) ClearAllComments() {
 	// Reset all file state, drop the review file entry and orphaned phantom entries.
 	filtered := make([]*FileEntry, 0, len(s.Files))
 	for _, f := range s.Files {
-		if filepath.Base(f.Path) == ".crit.json" || f.Orphaned {
+		// Drop the v4 review folder (`.crit`) and the legacy v3 flat file
+		// (`.crit.json`) so they never appear in the file list.
+		if base := filepath.Base(f.Path); base == ".crit" || base == ".crit.json" || f.Orphaned {
 			continue
 		}
 		f.Comments = []Comment{}
@@ -1470,13 +1553,16 @@ func (s *Session) ClearAllComments() {
 	s.Files = filtered
 	s.reviewComments = nil
 	s.ReviewRound = 1
+	s.RoundSnapshots = nil // v4 lock-discipline: reset in-lock alongside ReviewRound
 	s.lastCritJSONMtime = time.Time{}
 	s.pendingWrite = false
 	s.waitingForAgent = false
 	critPath := s.critJSONPath()
 	s.mu.Unlock()
-	// Delete the review file from disk (centralized or legacy path).
-	os.Remove(critPath) //nolint:errcheck
+	// Full-folder cleanup; idempotent on missing folder.
+	if err := os.RemoveAll(critPath); err != nil && !os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "Warning: removing review folder: %v\n", err)
+	}
 }
 
 // ChangeBaseBranch changes the diff base to the given branch, recomputes merge-base,
@@ -1583,18 +1669,37 @@ func (s *Session) ChangeBaseBranch(branch string) error { //nolint:gocyclo // in
 	return nil
 }
 
-// loadCritJSON loads comments and share state from an existing review file.
-func (s *Session) loadCritJSON() {
-	data, err := os.ReadFile(s.critJSONPath())
-	if err != nil {
-		return
+// reportLoadCritJSONLockViolation surfaces a post-SetSession loadCritJSON
+// call. In production it logs to stderr and returns so the daemon stays up;
+// in dev/CI (CRIT_DEBUG set) it panics so the regression fails loudly. See
+// plan v4 §Lock discipline.
+func reportLoadCritJSONLockViolation() {
+	const msg = "BUG: Session.loadCritJSON called post-SetSession; ignoring (see plan v4 §Lock discipline)"
+	if os.Getenv("CRIT_DEBUG") != "" {
+		panic(msg)
 	}
-	var cj CritJSON
-	if err := json.Unmarshal(data, &cj); err != nil {
-		return
-	}
+	fmt.Fprintln(os.Stderr, msg)
+}
 
-	// Only restore share state if the file set matches what was shared.
+// loadCritJSON loads comments and share state from an existing review file.
+//
+// Lock contract: PRE-SETSESSION ONLY. Safe to call only from the constructor
+// path (NewSessionFromFiles, applySessionOverrides, etc.) before any goroutine
+// reads s.RoundSnapshots / s.reviewComments / etc. Runtime callers that hold
+// s.mu.Lock() must use loadCritJSONLocked instead. See plan v4 §Lock discipline.
+func (s *Session) loadCritJSON() {
+	if s.sessionStarted.Load() != 0 {
+		reportLoadCritJSONLockViolation()
+		return
+	}
+	s.loadCritJSONLocked()
+}
+
+// restoreShareStateLocked copies share-related fields from cj into the
+// session, gated by share-scope match so we don't carry over a share
+// pointer when the file set has changed since the share was created.
+// Caller must hold s.mu.Lock() (or be the constructor pre-SetSession).
+func (s *Session) restoreShareStateLocked(cj *CritJSON) {
 	if cj.ShareScope != "" {
 		paths := make([]string, 0, len(s.Files))
 		for _, f := range s.Files {
@@ -1605,28 +1710,91 @@ func (s *Session) loadCritJSON() {
 			s.deleteToken = cj.DeleteToken
 			s.shareScope = cj.ShareScope
 		}
-	} else if cj.ShareURL != "" {
+		return
+	}
+	if cj.ShareURL != "" {
 		// No scope recorded — load unconditionally.
 		s.sharedURL = cj.ShareURL
 		s.deleteToken = cj.DeleteToken
 	}
+}
+
+// restoreFileCommentsLocked copies per-file comments from cj into matching
+// FileEntry slots, defaulting empty Scope to "line" for legacy comments.
+// Caller must hold s.mu.Lock() (or be the constructor pre-SetSession).
+func (s *Session) restoreFileCommentsLocked(cj *CritJSON) {
+	for _, f := range s.Files {
+		cf, ok := cj.Files[f.Path]
+		if !ok {
+			continue
+		}
+		f.Comments = cf.Comments
+		for i := range f.Comments {
+			if f.Comments[i].Scope == "" {
+				f.Comments[i].Scope = "line"
+			}
+		}
+	}
+}
+
+// loadCritJSONLocked is the runtime variant of loadCritJSON. It performs the
+// same disk read + in-memory restore but skips the pre-SetSession guard so
+// runtime code paths can reload comments after a state change (e.g. SetFocus
+// rebuilds s.Files and needs to repopulate per-file Comments from disk).
+//
+// Lock contract: caller MUST hold s.mu.Lock() (writer lock). The function
+// mutates s.Files[*].Comments, s.reviewComments, s.ReviewRound,
+// s.sharedURL/deleteToken/shareScope, and s.lastCritJSONMtime, all of which
+// race with concurrent readers under s.mu.RLock(). The pre-SetSession path
+// (loadCritJSON) gets away without the lock because no other goroutine has
+// observed the session yet.
+func (s *Session) loadCritJSONLocked() {
+	identity := s.critJSONPath()
+
+	// Capture identity-on-entry. If ReviewFilePath / OutputDir were set
+	// BEFORE this call (the canonical resumed-session path in cli_serve),
+	// the on-disk sidecar is already authoritative and we don't need to
+	// rewrite it from in-memory state. Used downstream to skip a
+	// redundant O(N*M) clone+marshal+rename on every cold boot.
+	identityOnEntry := s.ReviewFilePath != "" || s.OutputDir != ""
+
+	// MIGRATION-REMOVAL: trigger v3->v4 folder migration on read.
+	if err := ensureReviewFolder(identity); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: review folder migration: %v\n", err)
+	}
+
+	data, err := os.ReadFile(reviewPathsFor(identity).Review)
+	if err != nil {
+		// Fall through to the sidecar load — a folder may exist with only
+		// snapshots.json (orphan-snapshots) and we still want to surface that.
+		sidecarHadData := s.loadSnapshotsFromSidecar(identity)
+		// Persist the in-memory R1 baseline that NewSessionFromFiles captured
+		// in case ReviewFilePath / OutputDir was assigned just before this
+		// call (the canonical constructor-time path).
+		//
+		// Resumed-session optimization (review W5): when the sidecar already
+		// carried snapshots and identity was set on entry, the on-disk data
+		// is authoritative — skip the redundant rewrite.
+		if identityOnEntry && sidecarHadData {
+			s.captureRoundSnapshot(s.ReviewRound)
+			return
+		}
+		s.captureBaselineAndPersist()
+		return
+	}
+	var cj CritJSON
+	if err := json.Unmarshal(data, &cj); err != nil {
+		return
+	}
+
+	s.restoreShareStateLocked(&cj)
 
 	// Restore review round so the session continues from where it left off.
 	if cj.ReviewRound > s.ReviewRound {
 		s.ReviewRound = cj.ReviewRound
 	}
 
-	// Restore comments for files that match by path.
-	for _, f := range s.Files {
-		if cf, ok := cj.Files[f.Path]; ok {
-			f.Comments = cf.Comments
-			for i := range f.Comments {
-				if f.Comments[i].Scope == "" {
-					f.Comments[i].Scope = "line"
-				}
-			}
-		}
-	}
+	s.restoreFileCommentsLocked(&cj)
 
 	// Detect orphaned paths: files in the review file with comments but not in the session.
 	s.appendOrphanedFiles(cj.Files)
@@ -1635,9 +1803,49 @@ func (s *Session) loadCritJSON() {
 	s.reviewComments = cj.ReviewComments
 
 	// Record the mtime so the first ticker tick doesn't re-process our own file.
-	if info, err := os.Stat(s.critJSONPath()); err == nil {
+	if info, err := os.Stat(reviewPathsFor(s.critJSONPath()).Review); err == nil {
 		s.lastCritJSONMtime = info.ModTime()
 	}
+
+	// Restore round snapshots from the folder sidecar.
+	sidecarHadData := s.loadSnapshotsFromSidecar(s.critJSONPath())
+
+	// If ReviewFilePath / OutputDir was assigned just before this call (the
+	// canonical constructor-time path in cli_serve), the in-memory R1 baseline
+	// captured by NewSessionFromFiles hasn't been persisted yet. Re-run the
+	// best-effort persist now that the identity is known.
+	//
+	// Optimization (review W5): for a resumed session — identity already
+	// known on entry AND the sidecar carried a non-empty snapshot map — the
+	// on-disk sidecar is authoritative and rewriting it is redundant
+	// (O(N*M) clone+marshal+rename on every cold boot). The capture itself
+	// remains idempotent so we still call captureRoundSnapshot to keep R1
+	// well-defined in memory; we just skip the disk write.
+	if identityOnEntry && sidecarHadData {
+		s.captureRoundSnapshot(s.ReviewRound)
+		return
+	}
+	s.captureBaselineAndPersist()
+}
+
+// loadSnapshotsFromSidecar restores Session.RoundSnapshots from
+// <identity>/snapshots.json. Missing file = silent empty map. Malformed = log
+// + fall through (next round-complete rewrites it). Returns true when the
+// sidecar carried at least one snapshot (i.e. this is a resumed session).
+//
+// Lock contract: pre-SetSession or under s.mu.Lock(). Mutates s.RoundSnapshots.
+func (s *Session) loadSnapshotsFromSidecar(identity string) bool {
+	sidecarPath := reviewPathsFor(identity).Snapshots
+	sf, err := loadSnapshotsFile(sidecarPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: snapshots sidecar unreadable, ignoring: %v\n", err)
+		return false
+	}
+	if len(sf.RoundSnapshots) == 0 {
+		return false
+	}
+	s.RoundSnapshots = cloneRoundSnapshots(sf.RoundSnapshots)
+	return true
 }
 
 // restoreOrphanedComments reads the review file and creates phantom FileEntry
@@ -1645,7 +1853,7 @@ func (s *Session) loadCritJSON() {
 // Safe to call multiple times — existing entries (including previous orphans) are skipped.
 // Must be called with s.mu NOT held (acquires the lock internally).
 func (s *Session) restoreOrphanedComments() {
-	data, err := os.ReadFile(s.critJSONPath())
+	data, err := os.ReadFile(reviewPathsFor(s.critJSONPath()).Review)
 	if err != nil {
 		return
 	}

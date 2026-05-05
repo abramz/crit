@@ -64,16 +64,24 @@ func appendReply(cj *CritJSON, commentID, body, author, userID string, resolve b
 	for i, c := range cj.ReviewComments {
 		if c.ID == commentID {
 			reply := Reply{
-				ID:        randomReplyID(),
-				Body:      body,
-				Author:    author,
-				UserID:    userID,
-				CreatedAt: now,
+				ID:          randomReplyID(),
+				Body:        body,
+				Author:      author,
+				UserID:      userID,
+				CreatedAt:   now,
+				ReviewRound: cj.ReviewRound,
 			}
 			cj.ReviewComments[i].Replies = append(cj.ReviewComments[i].Replies, reply)
 			cj.ReviewComments[i].UpdatedAt = now
 			if resolve {
 				cj.ReviewComments[i].Resolved = true
+				cj.ReviewComments[i].ResolvedRound = cj.ReviewRound
+			} else {
+				// Match HTTP AddReviewCommentReply semantics: a non-resolving
+				// reply unresolves a previously-resolved comment so the new
+				// reply doesn't get hidden by the resolution filter.
+				cj.ReviewComments[i].Resolved = false
+				cj.ReviewComments[i].ResolvedRound = 0
 			}
 			return nil
 		}
@@ -92,16 +100,24 @@ func appendReply(cj *CritJSON, commentID, body, author, userID string, resolve b
 				if !found {
 					found = true
 					reply := Reply{
-						ID:        randomReplyID(),
-						Body:      body,
-						Author:    author,
-						UserID:    userID,
-						CreatedAt: now,
+						ID:          randomReplyID(),
+						Body:        body,
+						Author:      author,
+						UserID:      userID,
+						CreatedAt:   now,
+						ReviewRound: cj.ReviewRound,
 					}
 					cf.Comments[i].Replies = append(cf.Comments[i].Replies, reply)
 					cf.Comments[i].UpdatedAt = now
 					if resolve {
 						cf.Comments[i].Resolved = true
+						cf.Comments[i].ResolvedRound = cj.ReviewRound
+					} else {
+						// Match HTTP AddReply semantics: a non-resolving reply
+						// unresolves a previously-resolved comment so the new
+						// reply doesn't get hidden by the resolution filter.
+						cf.Comments[i].Resolved = false
+						cf.Comments[i].ResolvedRound = 0
 					}
 					cj.Files[filePath] = cf
 				}

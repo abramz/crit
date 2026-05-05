@@ -449,12 +449,36 @@ func (s *Session) handleRoundCompleteFiles() {
 	// Restore phantom entries for files that disappeared but have comments in the review file.
 	s.restoreOrphanedComments()
 
-	// Re-read all file contents and update hashes
+	// Re-read all file contents and update hashes.
 	// (snapshot markdown PreviousContent in case watcher hasn't polled yet)
+	//
+	// Capture the round we are about to commit BEFORE rereadFileContents and
+	// BEFORE incrementing ReviewRound. On the first round-complete after boot,
+	// ReviewRound == 1 (R1 baseline already captured at construction), so this
+	// captures R2.
 	s.mu.Lock()
+	nextRound := s.ReviewRound + 1
+	// INVARIANT: captureRoundSnapshot MUST run before rereadFileContents(true); reordering would snapshot the new on-disk content as the previous round and silently corrupt the timeline.
+	s.captureRoundSnapshot(nextRound)
+	sidecarPath := reviewPathsFor(s.critJSONPath()).Snapshots
+	sf := SnapshotsFile{RoundSnapshots: cloneRoundSnapshots(s.RoundSnapshots)}
 	s.rereadFileContents(true)
 	s.ReviewRound++
 	s.mu.Unlock()
+
+	// File I/O off the hot path. Drift between review.json and snapshots.json
+	// is benign (degrades to "no timeline available").
+	//
+	// ORDERING ASSUMPTION: sidecar writes from concurrent round-completes are
+	// serialized by the debounced round-complete handler upstream — only one
+	// round-complete is in-flight at a time, so the (clone-under-lock,
+	// release-lock, write-off-lock) sequence cannot interleave with a second
+	// captureRoundSnapshot/cloneRoundSnapshots cycle. If that upstream
+	// debounce ever changes (e.g. round-completes become parallel), move the
+	// saveSnapshotsFile call inside the s.mu.Lock() block above.
+	if err := saveSnapshotsFile(sidecarPath, sf); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: write snapshots sidecar: %v\n", err)
+	}
 
 	s.finishRoundComplete(edits)
 }
@@ -484,8 +508,8 @@ func (s *Session) emitRoundStatus(edits int) {
 // loadResolvedComments reads the review file to pick up resolved fields the agent wrote.
 func (s *Session) loadResolvedComments() {
 	critPath := s.critJSONPath()
-	info, statErr := os.Stat(critPath)
-	data, err := os.ReadFile(critPath)
+	info, statErr := os.Stat(reviewPathsFor(critPath).Review)
+	data, err := os.ReadFile(reviewPathsFor(critPath).Review)
 	if err != nil {
 		// No review file — clear all PreviousComments
 		s.mu.Lock()
