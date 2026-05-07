@@ -62,7 +62,7 @@ func TestReadCommentJSONInputMissingFile(t *testing.T) {
 
 func TestParseCommentJSONEntriesValid(t *testing.T) {
 	data := []byte(`[{"file":"main.go","line":42,"body":"fix"}]`)
-	entries, err := parseCommentJSONEntries(data)
+	entries, err := parseCommentJSONEntries(data, "-")
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -76,13 +76,13 @@ func TestParseCommentJSONEntriesRawNewlineInString(t *testing.T) {
 	// to give a better error for. We assemble the bytes manually so the test
 	// source itself stays well-formed.
 	data := []byte("[\n  {\"body\": \"line one\nline two\"}\n]")
-	_, err := parseCommentJSONEntries(data)
+	_, err := parseCommentJSONEntries(data, "bulk.json")
 	if err == nil {
 		t.Fatal("expected parse error, got nil")
 	}
 	msg := err.Error()
 	wants := []string{
-		"Error parsing JSON at byte ",
+		"Error parsing JSON from bulk.json at byte ",
 		"line ",
 		"column ",
 		">>>HERE<<<",
@@ -92,6 +92,34 @@ func TestParseCommentJSONEntriesRawNewlineInString(t *testing.T) {
 		if !strings.Contains(msg, w) {
 			t.Errorf("error message missing %q\nfull message:\n%s", w, msg)
 		}
+	}
+}
+
+func TestJSONSourceLabel(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"", "stdin"},
+		{"-", "stdin"},
+		{"bulk.json", "bulk.json"},
+		{"path/to/file.json", "path/to/file.json"},
+	}
+	for _, c := range cases {
+		got := jsonSourceLabel(c.in)
+		if got != c.want {
+			t.Errorf("jsonSourceLabel(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestFormatJSONParseError_NoOffset(t *testing.T) {
+	// errors.New produces an error with no offset info — exercises the
+	// !hasOffset branch in formatJSONParseError.
+	err := formatJSONParseError([]byte(`[]`), "test.json", errors.New("generic error"))
+	msg := err.Error()
+	if !strings.Contains(msg, "Error parsing JSON from test.json") {
+		t.Errorf("missing source label: %s", msg)
+	}
+	if !strings.Contains(msg, "generic error") {
+		t.Errorf("missing wrapped error: %s", msg)
 	}
 }
 
@@ -203,7 +231,7 @@ func TestRunCommentJSON_ParseErrorExits(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected non-zero exit; output: %s", out)
 	}
-	if !strings.Contains(string(out), "Error parsing JSON at byte ") {
+	if !strings.Contains(string(out), "Error parsing JSON from ") {
 		t.Errorf("missing formatted parse error: %s", out)
 	}
 	if !strings.Contains(string(out), `>>>HERE<<<`) {
