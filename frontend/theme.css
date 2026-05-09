@@ -151,6 +151,13 @@
   --crit-quote-highlight-border: rgba(250, 200, 60, 0.4);
   --crit-qr-bg: #fff;
 
+  /* ---- Comment reference chip ---- */
+  --crit-comment-ref-color:       #85aaf8;
+  --crit-comment-ref-color-hover: #94bcfb;
+  --crit-comment-ref-underline:   rgba(133, 170, 248, 0.35);
+  --crit-comment-ref-flash-bg:    rgba(187, 128, 9, 0.35);
+  --crit-comment-ref-flash-ring:  rgba(187, 128, 9, 0.85);
+
   --author-0-bg: rgba(110,160,230,0.15);
   --author-0-border: rgba(110,160,230,0.35);
   --author-0-fg: #7ab0f0;
@@ -284,6 +291,13 @@
     --crit-quote-highlight-bg:     rgba(250, 200, 60, 0.18);
     --crit-quote-highlight-border: rgba(200, 160, 30, 0.45);
     --crit-qr-bg: #fff;
+
+    /* ---- Comment reference chip ---- */
+    --crit-comment-ref-color:       #0550ae;
+    --crit-comment-ref-color-hover: #033d8b;
+    --crit-comment-ref-underline:   rgba(5, 80, 174, 0.50);
+    --crit-comment-ref-flash-bg:    rgba(255, 212, 59, 0.55);
+    --crit-comment-ref-flash-ring:  rgba(154, 103, 0, 0.70);
 
     --author-0-bg: rgba(26,95,160,0.10);
     --author-0-border: rgba(26,95,160,0.25);
@@ -419,6 +433,13 @@
   --crit-quote-highlight-border: rgba(250, 200, 60, 0.4);
   --crit-qr-bg: #fff;
 
+  /* ---- Comment reference chip ---- */
+  --crit-comment-ref-color:       #85aaf8;
+  --crit-comment-ref-color-hover: #94bcfb;
+  --crit-comment-ref-underline:   rgba(133, 170, 248, 0.35);
+  --crit-comment-ref-flash-bg:    rgba(187, 128, 9, 0.35);
+  --crit-comment-ref-flash-ring:  rgba(187, 128, 9, 0.85);
+
   --author-0-bg: rgba(110,160,230,0.15);
   --author-0-border: rgba(110,160,230,0.35);
   --author-0-fg: #7ab0f0;
@@ -551,6 +572,13 @@
   --crit-quote-highlight-bg:     rgba(250, 200, 60, 0.18);
   --crit-quote-highlight-border: rgba(200, 160, 30, 0.45);
   --crit-qr-bg: #fff;
+
+  /* ---- Comment reference chip ---- */
+  --crit-comment-ref-color:       #0550ae;
+  --crit-comment-ref-color-hover: #033d8b;
+  --crit-comment-ref-underline:   rgba(5, 80, 174, 0.50);
+  --crit-comment-ref-flash-bg:    rgba(255, 212, 59, 0.55);
+  --crit-comment-ref-flash-ring:  rgba(154, 103, 0, 0.70);
 
   --author-0-bg: rgba(26,95,160,0.10);
   --author-0-border: rgba(26,95,160,0.25);

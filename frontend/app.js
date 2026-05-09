@@ -36,6 +36,73 @@
     return '<span class="file-ref">' + escapeHtml(path) + '</span>';
   };
 
+  // Override code_inline so backtick-wrapped comment IDs render as the same chip.
+  const defaultCodeInline = commentMd.renderer.rules.code_inline || function(tokens, idx, options, _env, self) {
+    return self.renderToken(tokens, idx, options);
+  };
+  commentMd.renderer.rules.code_inline = function(tokens, idx, options, env, self) {
+    const content = tokens[idx].content;
+    if (/^(c|r|rp)_[a-f0-9]{6,}$/.test(content)) {
+      return '<span class="comment-ref comment-ref-code" data-ref-id="' + escapeHtml(content) + '">' + escapeHtml(content) + '</span>';
+    }
+    return defaultCodeInline(tokens, idx, options, env, self);
+  };
+
+  function linkifyCommentRefsInDom(el) {
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null, false);
+    const textNodes = [];
+    let node;
+    while ((node = walker.nextNode())) {
+      // skip text inside code/pre elements and already-linked chips
+      if (node.parentNode.closest('code, pre, .comment-ref')) continue;
+      textNodes.push(node);
+    }
+    const re = /((?:c|r|rp)_[a-f0-9]{6,})/g;
+    textNodes.forEach(function(tn) {
+      if (!re.test(tn.nodeValue)) { re.lastIndex = 0; return; }
+      re.lastIndex = 0;
+      const frag = document.createDocumentFragment();
+      let last = 0, m;
+      while ((m = re.exec(tn.nodeValue)) !== null) {
+        if (m.index > last) frag.appendChild(document.createTextNode(tn.nodeValue.slice(last, m.index)));
+        const span = document.createElement('span');
+        span.className = 'comment-ref';
+        span.dataset.refId = m[1];
+        span.textContent = m[1];
+        frag.appendChild(span);
+        last = m.index + m[0].length;
+      }
+      if (last < tn.nodeValue.length) frag.appendChild(document.createTextNode(tn.nodeValue.slice(last)));
+      tn.parentNode.replaceChild(frag, tn);
+    });
+  }
+
+  // Scroll/expand/flash a comment card located anywhere in the document, given just its id.
+  // Distinct from scrollToComment(commentId, filePath) below — that one needs filePath context.
+  function scrollToCommentRef(id) {
+    const card = document.querySelector('.comment-card[data-comment-id="' + CSS.escape(id) + '"]');
+    if (!card) return;
+    // Make sure any containing <details> file section is open
+    const section = card.closest('details');
+    if (section && !section.open) section.open = true;
+    if (card.classList.contains('collapsed')) {
+      card.classList.remove('collapsed');
+      if (typeof commentCollapseOverrides !== 'undefined') commentCollapseOverrides[id] = false;
+    }
+    card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    card.classList.remove('comment-ref-flash');
+    void card.offsetWidth;
+    card.classList.add('comment-ref-flash');
+    setTimeout(function() { card.classList.remove('comment-ref-flash'); }, 1650);
+  }
+
+  document.addEventListener('click', function(e) {
+    const ref = e.target.closest && e.target.closest('.comment-ref');
+    if (!ref) return;
+    e.preventDefault();
+    scrollToCommentRef(ref.dataset.refId);
+  });
+
   // ===== Suggestion Diff Renderer =====
   function renderSuggestionDiff(suggestionContent, originalLines) {
     const sugLines = suggestionContent.replace(/\n$/, '').split('\n');
@@ -5357,6 +5424,7 @@
     const bodyEl = document.createElement('div');
     bodyEl.className = 'comment-body';
     bodyEl.innerHTML = commentMd.render(comment.body, filePath ? buildCommentEnv(comment, filePath) : undefined);
+    linkifyCommentRefsInDom(bodyEl);
 
     card.appendChild(header);
 
@@ -5553,6 +5621,7 @@
       replyBody.className = 'reply-body';
       replyBody.dataset.rawBody = reply.body;
       replyBody.innerHTML = commentMd.render(reply.body);
+      linkifyCommentRefsInDom(replyBody);
       replyEl.appendChild(replyBody);
 
       repliesContainer.appendChild(replyEl);
@@ -6898,6 +6967,7 @@
       const descBody = document.createElement('div');
       descBody.className = 'pr-panel-description-body';
       descBody.innerHTML = commentMd.render(pr.pr_body);
+      linkifyCommentRefsInDom(descBody);
       descSection.appendChild(descBody);
 
       body.appendChild(descSection);
