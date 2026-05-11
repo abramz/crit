@@ -95,6 +95,7 @@ func NewServer(session *Session, frontendFS embed.FS, shareURL string, authToken
 	mux.HandleFunc("/api/config", s.withReady(s.handleConfig))
 	mux.HandleFunc("/api/session", s.withReady(s.handleSession))
 	mux.HandleFunc("/api/share", s.withReady(s.handleShare))
+	mux.HandleFunc("/api/share-consent", s.withReady(s.handleShareConsent))
 	mux.HandleFunc("/api/share-url", s.withReady(s.handleShareURL))
 	mux.HandleFunc("/api/finish", s.withReady(s.handleFinish))
 	mux.HandleFunc("/api/events", s.withReady(s.handleEvents))
@@ -322,6 +323,7 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	sess := s.session.Load()
 	resp := map[string]interface{}{
 		"share_url":         s.shareURL,
+		"needs_consent":     s.consentNeeded(),
 		"hosted_url":        sess.GetSharedURL(),
 		"delete_token":      sess.GetDeleteToken(),
 		"version":           s.currentVersion,
@@ -474,6 +476,50 @@ func filterFilesAtRound(session *Session, files []SessionFileInfo, round int) []
 	return out
 }
 
+// handleShareConsent records that the user has consented to sharing with the
+// default crit.md service. Called by the browser before the first share upload.
+// POST /api/share-consent
+func (s *Server) handleShareConsent(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := saveGlobalConfig(func(m map[string]json.RawMessage) error {
+		m["share_consented"] = json.RawMessage("true")
+		return nil
+	}); err != nil {
+		http.Error(w, "failed to persist consent", http.StatusInternalServerError)
+		return
+	}
+	s.authMu.Lock()
+	s.cfg.ShareConsented = true
+	s.authMu.Unlock()
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
+// consentNeeded reports whether the user must still confirm before sharing.
+// It guards reads of s.cfg.ShareConsented under s.authMu and, if the in-memory
+// flag is false, re-checks the on-disk global config so consent granted by the
+// CLI (crit share) on a separate process is picked up by the running daemon.
+func (s *Server) consentNeeded() bool {
+	s.authMu.RLock()
+	consented := s.cfg.ShareConsented
+	s.authMu.RUnlock()
+	if consented {
+		return false
+	}
+	if s.shareURL != defaultShareURL {
+		return false
+	}
+	if globalCfg, _, err := loadConfigFile(globalConfigPath()); err == nil && globalCfg.ShareConsented {
+		s.authMu.Lock()
+		s.cfg.ShareConsented = true
+		s.authMu.Unlock()
+		return false
+	}
+	return true
+}
+
 func (s *Server) handleShareURL(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPost:
@@ -507,6 +553,10 @@ func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.shareURL == "" {
 		http.Error(w, "share_url not configured", http.StatusBadRequest)
+		return
+	}
+	if s.consentNeeded() {
+		http.Error(w, "share consent required", http.StatusForbidden)
 		return
 	}
 

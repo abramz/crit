@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -193,6 +194,17 @@ func runShareNew(critPath string, files []shareFile, filePaths []string, svcURL,
 	}
 }
 
+// promptShareConsent prints the first-time consent message to out and reads the
+// user's answer from in. Returns true only if the user typed "y".
+func promptShareConsent(out io.Writer, in io.Reader) bool {
+	fmt.Fprintln(out, "  Your review will be securely uploaded to crit.md.")
+	fmt.Fprintln(out, "  You'll get a private link — share it with whoever you choose.")
+	fmt.Fprintln(out, "  You won't be asked again after confirming.")
+	fmt.Fprint(out, "\n  Continue? [y/N] ")
+	answer, _ := bufio.NewReader(in).ReadString('\n')
+	return strings.TrimSpace(strings.ToLower(answer)) == "y"
+}
+
 func runShare(args []string) {
 	sf := parseShareFlags(args)
 
@@ -226,6 +238,19 @@ func runShare(args []string) {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
+	}
+	// First-time consent gate: only for the default service, only for new shares
+	if !ok && needsShareConsent(cfg, sf.svcURL) {
+		if !promptShareConsent(os.Stderr, os.Stdin) {
+			return
+		}
+		if err := saveGlobalConfig(func(m map[string]json.RawMessage) error {
+			m["share_consented"] = json.RawMessage("true")
+			return nil
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "  warning: could not save consent: %v\n", err)
+		}
+		cfg.ShareConsented = true
 	}
 	if ok {
 		runShareExisting(existingCfg, critPath, files, sharePaths, authToken, cfg.Author, sf.showQR)

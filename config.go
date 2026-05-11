@@ -30,6 +30,14 @@ type Config struct {
 	AuthUserID         string   `json:"auth_user_id,omitempty"`
 	CleanupOnApprove   *bool    `json:"cleanup_on_approve,omitempty"`
 	VCS                string   `json:"vcs,omitempty"` // preferred VCS backend: "git", "sl", "jj"
+	ShareConsented     bool     `json:"share_consented,omitempty"`
+}
+
+// needsShareConsent reports whether the user must confirm before sharing.
+// Only applies to the default crit.md service — self-hosted users opted in by
+// configuring a custom URL.
+func needsShareConsent(cfg Config, shareURL string) bool {
+	return shareURL == defaultShareURL && !cfg.ShareConsented
 }
 
 // CleanupOnApproveEnabled returns whether review files should be cleaned up
@@ -113,6 +121,7 @@ type configPresence struct {
 	NoIntegrationCheck bool
 	NoUpdateCheck      bool
 	CleanupOnApprove   bool
+	ShareConsented     bool
 }
 
 // loadConfigFile reads and parses a single JSON config file.
@@ -140,6 +149,7 @@ func loadConfigFile(path string) (Config, configPresence, error) {
 	_, presence.NoIntegrationCheck = raw["no_integration_check"]
 	_, presence.NoUpdateCheck = raw["no_update_check"]
 	_, presence.CleanupOnApprove = raw["cleanup_on_approve"]
+	_, presence.ShareConsented = raw["share_consented"]
 
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return cfg, presence, fmt.Errorf("parsing %s: %w", path, err)

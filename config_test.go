@@ -113,6 +113,17 @@ func TestMergeConfigs(t *testing.T) {
 	}
 }
 
+func TestMergeConfigsShareConsentedFromGlobal(t *testing.T) {
+	// share_consented is global-only state. A `true` value set in the global
+	// config must survive the merge regardless of project config presence.
+	global := Config{ShareConsented: true}
+	project := Config{}
+	merged := mergeConfigs(global, project, configPresence{})
+	if !merged.ShareConsented {
+		t.Errorf("merged.ShareConsented = false, want true (global value lost)")
+	}
+}
+
 func TestMergeConfigsHostGlobalOnly(t *testing.T) {
 	// A project config must not override host — doing so would let a malicious
 	// repo disable the DNS-rebinding defense by setting host to "0.0.0.0".
@@ -792,5 +803,26 @@ func TestDefaultConfig(t *testing.T) {
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(s), &m); err != nil {
 		t.Errorf("defaultConfig().String() is not valid JSON: %v", err)
+	}
+}
+
+func TestNeedsShareConsent(t *testing.T) {
+	tests := []struct {
+		name     string
+		cfg      Config
+		shareURL string
+		want     bool
+	}{
+		{"default URL, not consented", Config{ShareConsented: false}, "https://crit.md", true},
+		{"default URL, already consented", Config{ShareConsented: true}, "https://crit.md", false},
+		{"self-hosted URL, not consented", Config{ShareConsented: false}, "https://my.company.com", false},
+		{"self-hosted URL, consented", Config{ShareConsented: true}, "https://my.company.com", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := needsShareConsent(tt.cfg, tt.shareURL); got != tt.want {
+				t.Errorf("needsShareConsent() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
