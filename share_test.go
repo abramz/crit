@@ -12,6 +12,62 @@ import (
 	"testing"
 )
 
+func TestDecodeJSONOrHTMLHint_HTML(t *testing.T) {
+	resp := &http.Response{Body: io.NopCloser(strings.NewReader("<html>login</html>"))}
+	var v map[string]any
+	err := decodeJSONOrHTMLHint(resp, &v)
+	if err == nil || !strings.Contains(err.Error(), "proxy_auth") {
+		t.Errorf("got %v, want error mentioning proxy_auth", err)
+	}
+}
+
+func TestDecodeJSONOrHTMLHint_HTMLWithLeadingWhitespace(t *testing.T) {
+	resp := &http.Response{Body: io.NopCloser(strings.NewReader("\n\n  <!DOCTYPE html><html>x</html>"))}
+	var v map[string]any
+	err := decodeJSONOrHTMLHint(resp, &v)
+	if err == nil || !strings.Contains(err.Error(), "proxy_auth") {
+		t.Errorf("got %v, want proxy_auth hint", err)
+	}
+}
+
+func TestDecodeJSONOrHTMLHint_ValidJSON(t *testing.T) {
+	resp := &http.Response{Body: io.NopCloser(strings.NewReader(`{"x":1}`))}
+	var v map[string]any
+	if err := decodeJSONOrHTMLHint(resp, &v); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if v["x"].(float64) != 1 {
+		t.Errorf("decode wrong: %v", v)
+	}
+}
+
+func TestDecodeJSONOrHTMLHint_InvalidJSON(t *testing.T) {
+	resp := &http.Response{Body: io.NopCloser(strings.NewReader(`not json at all`))}
+	var v map[string]any
+	err := decodeJSONOrHTMLHint(resp, &v)
+	if err == nil || !strings.Contains(err.Error(), "decode share response") {
+		t.Errorf("got %v, want decode error", err)
+	}
+}
+
+func TestTokenFromHostedURL(t *testing.T) {
+	cases := map[string]string{
+		"https://crit.example/r/abc123":      "abc123",
+		"https://crit.example/r/abc123/":     "abc123",
+		"https://crit.example/r/abc123?x=1":  "abc123",
+		"https://crit.example/r/abc123#frag": "abc123",
+		"https://crit.example/foo/bar":       "",
+		"https://crit.example/":              "",
+		"":                                   "",
+		"not a url at all":                   "",
+	}
+	for input, want := range cases {
+		if got := tokenFromHostedURL(input); got != want {
+			t.Errorf("tokenFromHostedURL(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
 func TestComputeShareHash(t *testing.T) {
 	files := []shareFile{{Path: "plan.md", Content: "hello"}}
 	comments := []shareComment{{ExternalID: "c1", Resolved: false}}
@@ -2095,5 +2151,122 @@ func TestShareReviewFiles_PlanMode_InlinesAttachments(t *testing.T) {
 	}
 	if !strings.Contains(rb, "data:image/png;base64,") {
 		t.Errorf("plan-mode reply body missing data URI: %q", truncate(rb, 200))
+	}
+}
+
+func TestDedupWebComments(t *testing.T) {
+	tests := []struct {
+		name        string
+		existing    CritJSON
+		incoming    []webComment
+		wantNew     int
+		wantReplies int
+	}{
+		{
+			name: "duplicate by external_id is skipped",
+			existing: CritJSON{
+				Files: map[string]CritJSONFile{
+					"main.go": {Comments: []Comment{{
+						ID: "c_abc", StartLine: 10, EndLine: 10,
+						Body: "fix this",
+					}}},
+				},
+			},
+			incoming: []webComment{{
+				ExternalID: "c_abc", FilePath: "main.go",
+				StartLine: 10, EndLine: 10, Body: "fix this",
+			}},
+			wantNew: 0, wantReplies: 0,
+		},
+		{
+			name: "duplicate by external_id with new replies merges replies",
+			existing: CritJSON{
+				Files: map[string]CritJSONFile{
+					"main.go": {Comments: []Comment{{
+						ID: "c_abc", StartLine: 10, EndLine: 10,
+						Body: "fix this",
+					}}},
+				},
+			},
+			incoming: []webComment{{
+				ExternalID: "c_abc", FilePath: "main.go",
+				StartLine: 10, EndLine: 10, Body: "fix this",
+				Replies: []webReply{{Body: "done", AuthorDisplayName: "reviewer"}},
+			}},
+			wantNew: 0, wantReplies: 1,
+		},
+		{
+			name: "duplicate by fingerprint is skipped",
+			existing: CritJSON{
+				Files: map[string]CritJSONFile{
+					"main.go": {Comments: []Comment{{
+						ID: "web-1", StartLine: 5, EndLine: 5,
+						Body: "typo here",
+					}}},
+				},
+			},
+			incoming: []webComment{{
+				FilePath: "main.go", StartLine: 5, EndLine: 5,
+				Body: "typo here",
+			}},
+			wantNew: 0, wantReplies: 0,
+		},
+		{
+			name: "genuinely new comment is kept",
+			existing: CritJSON{
+				Files: map[string]CritJSONFile{
+					"main.go": {Comments: []Comment{{
+						ID: "c_abc", StartLine: 10, EndLine: 10,
+						Body: "fix this",
+					}}},
+				},
+			},
+			incoming: []webComment{{
+				FilePath: "main.go", StartLine: 20, EndLine: 20,
+				Body:              "new issue here",
+				AuthorDisplayName: "reviewer",
+			}},
+			wantNew: 1, wantReplies: 0,
+		},
+		{
+			name: "mix of duplicates and new",
+			existing: CritJSON{
+				Files: map[string]CritJSONFile{
+					"main.go": {Comments: []Comment{{
+						ID: "c_abc", StartLine: 10, EndLine: 10,
+						Body: "existing",
+					}}},
+				},
+			},
+			incoming: []webComment{
+				{ExternalID: "c_abc", FilePath: "main.go", StartLine: 10, EndLine: 10, Body: "existing"},
+				{FilePath: "main.go", StartLine: 30, EndLine: 30, Body: "brand new"},
+			},
+			wantNew: 1, wantReplies: 0,
+		},
+		{
+			name: "review-level duplicate by fingerprint is skipped",
+			existing: CritJSON{
+				ReviewComments: []Comment{{
+					ID: "web-1", Body: "overall looks good",
+				}},
+			},
+			incoming: []webComment{{
+				Scope: "review", Body: "overall looks good",
+			}},
+			wantNew: 0, wantReplies: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			newComments, replyUpdates := dedupWebComments(tt.existing, tt.incoming)
+			if len(newComments) != tt.wantNew {
+				t.Errorf("got %d new comments, want %d", len(newComments), tt.wantNew)
+			}
+			if len(replyUpdates) != tt.wantReplies {
+				t.Errorf("got %d reply updates, want %d", len(replyUpdates), tt.wantReplies)
+			}
+		})
 	}
 }
