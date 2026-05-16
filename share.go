@@ -22,6 +22,36 @@ import (
 // when no share URL is configured via flag, env, or config.
 const defaultShareURL = "https://crit.md"
 
+// checkShareAllowed returns an error when the review at critPath is a design
+// review. Sharing design reviews is deferred (v1 spec §Non-goals).
+func checkShareAllowed(critPath string) error {
+	data, err := os.ReadFile(reviewPathsFor(critPath).Review)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	var cj CritJSON
+	if err := json.Unmarshal(data, &cj); err != nil {
+		return nil //nolint:nilerr // malformed review file: do not block share
+	}
+	if cj.ReviewType == "design" {
+		return fmt.Errorf("crit share is not supported for design reviews in v1")
+	}
+	return nil
+}
+
+// checkGitHubSyncAllowed gates `crit pull` and `crit push` from running on
+// design reviews. Design pins have no line anchors and cannot round-trip
+// through GitHub PR review comments.
+func checkGitHubSyncAllowed(cj CritJSON, op string) error {
+	if cj.ReviewType == "design" {
+		return fmt.Errorf("%s is not supported for design reviews", op)
+	}
+	return nil
+}
+
 // errShareUnauthorized indicates the share endpoint rejected the bearer token.
 // Callers wrap this and inspect with errors.Is so they can clear the cached
 // auth identity (token + user id + name + email) on top-level share/upsert

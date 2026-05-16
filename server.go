@@ -92,6 +92,28 @@ func NewServer(session *Session, frontendFS embed.FS, shareURL string, proxyAuth
 	mux.HandleFunc("/api/health", s.handleHealth)
 	mux.HandleFunc("/api/qr", s.handleQR)
 
+	// Design-mode routes — NOT wrapped in withReady.
+	mux.HandleFunc("/design", s.handleDesignPage)
+	mux.HandleFunc("/crit-agent.js", s.handleCritAgentJS)
+	mux.HandleFunc("/agent-protocol.js", s.serveEmbeddedJS("agent-protocol.js"))
+	mux.HandleFunc("/agent-anchor-utils.js", s.serveEmbeddedJS("agent-anchor-utils.js"))
+	mux.HandleFunc("/agent-marker-overlay.js", s.serveEmbeddedJS("agent-marker-overlay.js"))
+	mux.HandleFunc("/agent-mutation-batcher.js", s.serveEmbeddedJS("agent-mutation-batcher.js"))
+	mux.HandleFunc("/agent-resolution.js", s.serveEmbeddedJS("agent-resolution.js"))
+	mux.HandleFunc("/agent-reanchor-state.js", s.serveEmbeddedJS("agent-reanchor-state.js"))
+	mux.HandleFunc("/agent-marker.css", s.serveEmbeddedCSS("agent-marker.css"))
+	mux.HandleFunc("/design-mode-pin-filter.js", s.serveEmbeddedJS("design-mode-pin-filter.js"))
+	mux.HandleFunc("/design-mode-resolution-gate.js", s.serveEmbeddedJS("design-mode-resolution-gate.js"))
+	mux.HandleFunc("/design-mode-drift-tray.js", s.serveEmbeddedJS("design-mode-drift-tray.js"))
+	mux.HandleFunc("/design-mode-pin-state.js", s.serveEmbeddedJS("design-mode-pin-state.js"))
+	mux.HandleFunc("/design-mode-thread-scroll.js", s.serveEmbeddedJS("design-mode-thread-scroll.js"))
+	mux.HandleFunc("/design-mode-reanchor-click.js", s.serveEmbeddedJS("design-mode-reanchor-click.js"))
+	mux.HandleFunc("/design-mode-reanchor-put.js", s.serveEmbeddedJS("design-mode-reanchor-put.js"))
+	mux.HandleFunc("/design-mode-deeplink.js", s.serveEmbeddedJS("design-mode-deeplink.js"))
+	mux.HandleFunc("/design-mode-round-resolve.js", s.serveEmbeddedJS("design-mode-round-resolve.js"))
+	mux.HandleFunc("/design-mode-round-tooltip.js", s.serveEmbeddedJS("design-mode-round-tooltip.js"))
+	mux.HandleFunc("/design-mode.menu-controller.js", s.serveEmbeddedJS("design-mode.menu-controller.js"))
+
 	// Session-dependent endpoints (guarded by withReady middleware)
 	mux.HandleFunc("/api/review-cycle", s.withReady(s.handleReviewCycle))
 	mux.HandleFunc("/api/config", s.withReady(s.handleConfig))
@@ -476,7 +498,88 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	if hasRound && session != nil && session.Mode == "files" {
 		info.Files = filterFilesAtRound(session, info.Files, round)
 	}
-	writeJSON(w, info)
+	type designSessionResponse struct {
+		SessionInfo
+		ReviewType string `json:"review_type,omitempty"`
+		Origin     string `json:"origin,omitempty"`
+		ProxyPort  int    `json:"proxy_port,omitempty"`
+	}
+	resp := designSessionResponse{SessionInfo: info}
+	if session != nil {
+		resp.ReviewType = session.ReviewType
+		resp.Origin = session.Origin
+		resp.ProxyPort = session.ProxyPort
+	}
+	writeJSON(w, resp)
+}
+
+func (s *Server) handleDesignPage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	f, err := s.assets.Open("index.html")
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	defer f.Close()
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	io.Copy(w, f)
+}
+
+func (s *Server) handleCritAgentJS(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	f, err := s.assets.Open("crit-agent.js")
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	defer f.Close()
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+	io.Copy(w, f)
+}
+
+func (s *Server) serveEmbeddedJS(name string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		f, err := s.assets.Open(name)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		defer f.Close()
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		io.Copy(w, f)
+	}
+}
+
+func (s *Server) serveEmbeddedCSS(name string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		f, err := s.assets.Open(name)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		defer f.Close()
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Content-Type", "text/css; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		io.Copy(w, f)
+	}
 }
 
 // filterFilesAtRound returns the subset of files that have a snapshot recorded
@@ -1077,13 +1180,14 @@ func (s *Server) handleFileComments(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		r.Body = http.MaxBytesReader(w, r.Body, 10<<20) // 10MB
 		var req struct {
-			StartLine int    `json:"start_line"`
-			EndLine   int    `json:"end_line"`
-			Side      string `json:"side"`
-			Body      string `json:"body"`
-			Quote     string `json:"quote"`
-			Author    string `json:"author"`
-			Scope     string `json:"scope"`
+			StartLine int        `json:"start_line"`
+			EndLine   int        `json:"end_line"`
+			Side      string     `json:"side"`
+			Body      string     `json:"body"`
+			Quote     string     `json:"quote"`
+			Author    string     `json:"author"`
+			Scope     string     `json:"scope"`
+			DOMAnchor *DOMAnchor `json:"dom_anchor"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "Invalid request body", http.StatusBadRequest)
@@ -1091,6 +1195,30 @@ func (s *Server) handleFileComments(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.Body == "" {
 			http.Error(w, "Comment body is required", http.StatusBadRequest)
+			return
+		}
+
+		// Design pin: route to AddDesignPin before line validation.
+		if req.DOMAnchor != nil {
+			author := req.Author
+			if author == "" {
+				author = s.author
+			}
+			sess := s.session.Load()
+			c, ok := sess.AddDesignPin(path, req.Body, author, s.authUserID(), req.DOMAnchor)
+			if !ok {
+				http.Error(w, "Design pin rejected", http.StatusBadRequest)
+				return
+			}
+			// Fan out to SSE so other tabs (and the originating tab's review
+			// panel) refresh without waiting for the watcher's 1s mtime tick.
+			// The watcher's mergeExternalCritJSON path is suppressed for the
+			// daemon's own writes (lastCritJSONMtime equals disk mtime after
+			// WriteFiles), so cross-tab sync would otherwise stall until an
+			// external mutation. Emitting here closes that gap for design pins.
+			sess.notify(SSEEvent{Type: "comments-changed"})
+			w.WriteHeader(http.StatusCreated)
+			writeJSON(w, c)
 			return
 		}
 
@@ -1214,9 +1342,62 @@ func (s *Server) handleFileCommentResolve(w http.ResponseWriter, r *http.Request
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
-	c, ok := s.session.Load().SetCommentResolved(path, commentID, req.Resolved)
+	sess := s.session.Load()
+	c, ok := sess.SetCommentResolved(path, commentID, req.Resolved)
 	if !ok {
 		http.Error(w, "Comment not found", http.StatusNotFound)
+		return
+	}
+	// Fan out to SSE so other tabs (and the originating tab's review
+	// panel) reflect the resolved-state flip without waiting for the
+	// watcher's 1s mtime tick. Insert/reply/delete already broadcast;
+	// resolve must too.
+	sess.notify(SSEEvent{Type: "comments-changed"})
+	writeJSON(w, c)
+}
+
+// handleFileCommentPut decodes the PUT patch and applies body/anchor +
+// design-mode drift patches in one shot. Extracted from handleFileCommentUpdate
+// to keep that switch's cyclomatic complexity within budget.
+func (s *Server) handleFileCommentPut(w http.ResponseWriter, r *http.Request, path, id string) {
+	r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
+	var req struct {
+		Body           string     `json:"body"`
+		DOMAnchor      *DOMAnchor `json:"dom_anchor"`
+		Drifted        *bool      `json:"drifted,omitempty"`
+		DriftedOnRound *int       `json:"drifted_on_round,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+	isDriftPatch := req.Drifted != nil || req.DriftedOnRound != nil
+	if !isDriftPatch && req.Body == "" && req.DOMAnchor == nil {
+		http.Error(w, "Comment body is required", http.StatusBadRequest)
+		return
+	}
+	sess := s.session.Load()
+	if isDriftPatch {
+		c, ok := sess.PatchCommentDrift(path, id, req.Drifted, req.DriftedOnRound)
+		if !ok {
+			http.Error(w, "Comment not found", http.StatusNotFound)
+			return
+		}
+		if req.Body == "" && req.DOMAnchor == nil {
+			writeJSON(w, c)
+			return
+		}
+	}
+	c, ok, reason := sess.UpdateCommentWithAnchor(path, id, req.Body, req.DOMAnchor)
+	if !ok {
+		switch reason {
+		case "not_found":
+			http.Error(w, "Comment not found", http.StatusNotFound)
+		case "anchor_on_code_comment":
+			http.Error(w, "dom_anchor is only valid on design pins", http.StatusBadRequest)
+		default:
+			http.Error(w, "Update failed", http.StatusBadRequest)
+		}
 		return
 	}
 	writeJSON(w, c)
@@ -1226,30 +1407,30 @@ func (s *Server) handleFileCommentResolve(w http.ResponseWriter, r *http.Request
 func (s *Server) handleFileCommentUpdate(w http.ResponseWriter, r *http.Request, path, id string) {
 	switch r.Method {
 	case http.MethodPut:
-		r.Body = http.MaxBytesReader(w, r.Body, 10<<20) // 10MB
-		var req struct {
-			Body string `json:"body"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid request body", http.StatusBadRequest)
-			return
-		}
-		if req.Body == "" {
-			http.Error(w, "Comment body is required", http.StatusBadRequest)
-			return
-		}
-		c, ok := s.session.Load().UpdateComment(path, id, req.Body)
-		if !ok {
-			http.Error(w, "Comment not found", http.StatusNotFound)
-			return
-		}
-		writeJSON(w, c)
+		s.handleFileCommentPut(w, r, path, id)
 
 	case http.MethodDelete:
-		if !s.session.Load().DeleteComment(path, id) {
+		sess := s.session.Load()
+		// Authorize before delete: when the comment carries a non-empty
+		// UserID, only that user (matched against the daemon's configured
+		// AuthUserID) may delete it. Comments with empty UserID (legacy or
+		// unauthed sessions) remain deletable by anyone — preserving
+		// compatibility with file-mode reviews where AuthUserID is unset.
+		// Replies cascade automatically because they're nested inside the
+		// parent Comment struct.
+		switch sess.DeleteFileCommentAs(path, id, s.authUserID()) {
+		case deleteResultNotFound:
 			http.Error(w, "Comment not found", http.StatusNotFound)
 			return
+		case deleteResultForbidden:
+			http.Error(w, "Forbidden: only the comment's author may delete it", http.StatusForbidden)
+			return
 		}
+		// Fan out to SSE so other tabs (and the originating tab's review
+		// panel) drop the deleted comment without waiting for the watcher's
+		// 1s mtime tick. Insert and reply paths already broadcast; delete
+		// must too.
+		sess.notify(SSEEvent{Type: "comments-changed"})
 		writeJSON(w, map[string]string{"status": "deleted"})
 
 	default:
@@ -1374,15 +1555,34 @@ func handleReplyCRUD(w http.ResponseWriter, r *http.Request, replyID string, ops
 }
 
 func (s *Server) handleReplyRoute(w http.ResponseWriter, r *http.Request, filePath, commentID, replyID string) {
+	sess := s.session.Load()
+	// Wrap each op so that successful mutations fan out comments-changed to
+	// SSE subscribers. The watcher's mergeExternalCritJSON path is suppressed
+	// for the daemon's own writes (lastCritJSONMtime equals disk mtime after
+	// WriteFiles), so cross-tab sync would otherwise stall on reply CRUD in
+	// design mode until an external mutation arrived.
+	notify := func() { sess.notify(SSEEvent{Type: "comments-changed"}) }
 	handleReplyCRUD(w, r, replyID, replyOps{
 		add: func(body, author string) (Reply, bool) {
-			return s.session.Load().AddReply(filePath, commentID, body, author, s.authUserID())
+			rep, ok := sess.AddReply(filePath, commentID, body, author, s.authUserID())
+			if ok {
+				notify()
+			}
+			return rep, ok
 		},
 		update: func(rid, body string) (Reply, bool) {
-			return s.session.Load().UpdateReply(filePath, commentID, rid, body)
+			rep, ok := sess.UpdateReply(filePath, commentID, rid, body)
+			if ok {
+				notify()
+			}
+			return rep, ok
 		},
 		delete: func(rid string) bool {
-			return s.session.Load().DeleteReply(filePath, commentID, rid)
+			ok := sess.DeleteReply(filePath, commentID, rid)
+			if ok {
+				notify()
+			}
+			return ok
 		},
 	})
 }
@@ -1473,11 +1673,17 @@ func (s *Server) handleReviewCommentResolve(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
-	c, ok := s.session.Load().ResolveReviewComment(commentID, req.Resolved)
+	sess := s.session.Load()
+	c, ok := sess.ResolveReviewComment(commentID, req.Resolved)
 	if !ok {
 		http.Error(w, "Comment not found", http.StatusNotFound)
 		return
 	}
+	// Fan out to SSE so other tabs (and the originating tab's review
+	// panel) reflect the resolved-state flip without waiting for the
+	// watcher's 1s mtime tick. Insert/reply/delete already broadcast;
+	// resolve must too.
+	sess.notify(SSEEvent{Type: "comments-changed"})
 	writeJSON(w, c)
 }
 

@@ -19,7 +19,7 @@ import (
 	qrterminal "github.com/mdp/qrterminal/v3"
 )
 
-//go:embed frontend/*
+//go:embed frontend/*.html frontend/*.css frontend/*.js frontend/*.png frontend/*.svg frontend/*.ico frontend/*.webmanifest
 var frontendFS embed.FS
 
 //go:embed integrations/*
@@ -40,7 +40,12 @@ func main() {
 		handler(os.Args[2:])
 		return
 	}
-	runReview(os.Args[1:])
+	args := os.Args[1:]
+	if looksLikeDesignArgs(args) {
+		runDesign(args)
+		return
+	}
+	runReview(args)
 }
 
 type shareFlags struct {
@@ -241,6 +246,10 @@ func runShare(args []string) {
 
 	critPath, err := resolveReviewPath(sf.outputDir)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	if err := checkShareAllowed(critPath); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
@@ -550,7 +559,7 @@ func redirectReviewPathForPR(prNumber int, cwdBranch, cwdCritPath string) (strin
 	return altPath, altCJ, true
 }
 
-func runPull(args []string) {
+func runPull(args []string) { //nolint:gocyclo // CLI dispatcher: branches for arg/flag parsing, file load, scope resolution, and design-review guard
 	if err := requireGH(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -619,6 +628,11 @@ func runPull(args []string) {
 		}
 		cj.BaseRef, _ = MergeBase(base)
 		cj.ReviewRound = 1
+	}
+
+	if err := checkGitHubSyncAllowed(cj, "crit pull"); err != nil {
+		fmt.Fprintln(os.Stderr, "Error: "+err.Error())
+		os.Exit(1)
 	}
 
 	scope := resolvePullScope(&cj)
@@ -1075,6 +1089,11 @@ func pushBlockedByFullStackScope(activeScope string) bool {
 func runPush(args []string) {
 	ctx := loadPushContext(args)
 
+	if err := checkGitHubSyncAllowed(ctx.cj, "crit push"); err != nil {
+		fmt.Fprintln(os.Stderr, "Error: "+err.Error())
+		os.Exit(1)
+	}
+
 	// Full-stack push gate — see fullStackPushGateMessage.
 	if pushBlockedByFullStackScope(ctx.cj.ActiveDiffScope) {
 		fmt.Fprintln(os.Stderr, "Error: "+fullStackPushGateMessage)
@@ -1468,6 +1487,12 @@ func runCommentLineLevelScoped(loc string, commentArgs []string, author, userID,
 		startLine, endLine = n, n
 	}
 	body := strings.Join(commentArgs[1:], " ")
+	if critPath, err := resolveReviewPath(outputDir); err == nil {
+		if guardErr := checkCommentCLIAllowed(critPath); guardErr != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", guardErr)
+			os.Exit(1)
+		}
+	}
 	if err := addCommentToCritJSONScoped(filePath, startLine, endLine, body, author, userID, outputDir, scope); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -2326,6 +2351,12 @@ func addReviewStats(result map[string]interface{}, revPath string) {
 		return
 	}
 	result["round"] = cj.ReviewRound
+	if cj.ReviewType != "" {
+		result["review_type"] = cj.ReviewType
+	}
+	if cj.Origin != "" {
+		result["origin"] = cj.Origin
+	}
 	unresolved, resolved := countComments(cj)
 	result["comments"] = map[string]int{
 		"unresolved": unresolved,
@@ -2356,6 +2387,12 @@ func printStatusHuman(vcsName, branch, revPath string, revExists bool, session *
 	var cj CritJSON
 	if json.Unmarshal(data, &cj) != nil {
 		return
+	}
+	if cj.ReviewType == "design" {
+		fmt.Printf("Mode:        design\n")
+		if cj.Origin != "" {
+			fmt.Printf("Origin:      %s\n", cj.Origin)
+		}
 	}
 	fmt.Printf("Round:       %d\n", cj.ReviewRound)
 	unresolved, resolved := countComments(cj)
@@ -2419,12 +2456,7 @@ func runCleanup(args []string) {
 
 	fmt.Printf("Found %d stale review file%s:\n", len(stale), plural(len(stale)))
 	for _, s := range stale {
-		ageDays := int(s.age.Hours() / 24)
-		branchInfo := ""
-		if s.branch != "" {
-			branchInfo = s.branch + ", "
-		}
-		fmt.Printf("  %s  (%s%d days old, %d comment%s)\n", s.path, branchInfo, ageDays, s.comments, plural(s.comments))
+		fmt.Printf("  %s  (%s%d days old, %d comment%s)\n", s.path, s.metaLabel(), int(s.age.Hours()/24), s.comments, plural(s.comments))
 	}
 
 	if !force {
@@ -2443,11 +2475,26 @@ func runCleanup(args []string) {
 }
 
 type staleReview struct {
-	key      string
-	path     string
-	branch   string
-	age      time.Duration
-	comments int
+	key        string
+	path       string
+	branch     string
+	reviewType string
+	origin     string
+	age        time.Duration
+	comments   int
+}
+
+func (s staleReview) metaLabel() string {
+	if s.reviewType == "design" {
+		if s.origin != "" {
+			return "design: " + s.origin + ", "
+		}
+		return "design, "
+	}
+	if s.branch != "" {
+		return s.branch + ", "
+	}
+	return ""
 }
 
 func findStaleReviews(revDir string, days int) []staleReview {
@@ -2513,9 +2560,13 @@ func checkStaleReviewFolder(revDir string, de os.DirEntry, key string, cutoff ti
 		var cj CritJSON
 		var updatedAt time.Time
 		var branch string
+		var reviewType string
+		var origin string
 		var commentCount int
 		if json.Unmarshal(data, &cj) == nil {
 			branch = cj.Branch
+			reviewType = cj.ReviewType
+			origin = cj.Origin
 			if t, parseErr := time.Parse(time.RFC3339, cj.UpdatedAt); parseErr == nil {
 				updatedAt = t
 			}
@@ -2533,11 +2584,13 @@ func checkStaleReviewFolder(revDir string, de os.DirEntry, key string, cutoff ti
 			return staleReview{}, false
 		}
 		return staleReview{
-			key:      key,
-			path:     folder,
-			branch:   branch,
-			age:      time.Since(updatedAt),
-			comments: commentCount,
+			key:        key,
+			path:       folder,
+			branch:     branch,
+			reviewType: reviewType,
+			origin:     origin,
+			age:        time.Since(updatedAt),
+			comments:   commentCount,
 		}, true
 	}
 

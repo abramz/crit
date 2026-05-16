@@ -560,6 +560,10 @@
     return form.filePath + ':' + form.startLine + ':' + form.endLine + ':' + (form.side || '');
   }
 
+  // Convention-based form-key for edit/reply forms keyed by comment id.
+  // Used by buildCommentCard reply input + design-mode mounts.
+  // Delegates to the shared helper module so both controllers stay aligned.
+
   function addForm(form) {
     form.formKey = formKey(form);
     const idx = activeForms.findIndex(function(f) { return f.formKey === form.formKey; });
@@ -597,14 +601,11 @@
 
   const enc = encodeURIComponent;
 
-  // Author color-coding for multi-reviewer comments
-  const AUTHOR_COLOR_COUNT = 6;
-
-  function authorColorIndex(name) {
-    let hash = 0;
-    for (const ch of name) hash = ((hash << 5) - hash + ch.charCodeAt(0)) | 0;
-    return Math.abs(hash) % AUTHOR_COLOR_COUNT;
-  }
+  // Author color-coding for multi-reviewer comments — shared helper so
+  // design-mode mounts produce matching swatch indices. The helpers module
+  // is loaded before app.js via index.html script order, so we reference it
+  // directly without a local fallback.
+  const authorColorIndex = window.crit.commentCardHelpers.authorColorIndex;
 
   // Sort comparator: directories before files at each depth, then alphabetical.
   // In files mode the user's CLI argument order is meaningful, so preserve it
@@ -820,50 +821,44 @@
     }
   }
 
+  // Wraps crit.shared.waitForSession with the app.js-specific UI:
+  // an elapsed-seconds "Initializing..." loader in #filesContainer, a
+  // server-disconnected message on network failure, and a body.message
+  // surfacing on HTTP 500. Returns the parsed JSON payload (matches
+  // the previous .then(r => r.json()) call sites at the seam).
   async function fetchWhenReady(url) {
-    const start = Date.now();
-    const maxWait = 5 * 60 * 1000; // 5 minutes
-    while (true) {
-      let r;
-      try {
-        r = await fetch(url);
-      } catch {
-        // Network error — server may have shut down during init
-        const el = document.getElementById('filesContainer');
-        if (el) {
-          el.innerHTML =
-            '<div class="loading" style="padding: 40px; text-align: center; color: var(--crit-editor-fg-muted);">' +
-            'Server disconnected</div>';
-        }
-        throw new Error('Server disconnected');
-      }
-      if (r.status === 503) {
-        if (Date.now() - start > maxWait) {
-          throw new Error('Server did not finish initializing within 5 minutes');
-        }
-        const elapsed = Math.round((Date.now() - start) / 1000);
-        const loadingEl = document.getElementById('filesContainer');
-        if (loadingEl) {
-          loadingEl.innerHTML =
-            '<div class="loading" style="padding: 40px; text-align: center; color: var(--crit-editor-fg-muted);">' +
-            'Initializing\u2026 (' + elapsed + 's)</div>';
-        }
-        await new Promise(function(resolve) { setTimeout(resolve, 500); });
-        continue;
-      }
-      if (r.status === 500) {
-        let body = {};
-        try { body = await r.json(); } catch {}
-        const msg = body.message || 'Server initialization failed';
-        document.getElementById('filesContainer').innerHTML =
+    function renderLoading(text) {
+      const el = document.getElementById('filesContainer');
+      if (el) {
+        el.innerHTML =
           '<div class="loading" style="padding: 40px; text-align: center; color: var(--crit-editor-fg-muted);">' +
-          msg + '</div>';
+          text + '</div>';
+      }
+    }
+    try {
+      return await window.crit.shared.waitForSession({
+        url: url,
+        intervalMs: 500,
+        maxWaitMs: 5 * 60 * 1000,
+        onProgress: function (elapsedMs) {
+          const elapsed = Math.round(elapsedMs / 1000);
+          renderLoading('Initializing\u2026 (' + elapsed + 's)');
+        },
+      });
+    } catch (err) {
+      if (err && err.status === 500 && err.response) {
+        let body = {};
+        try { body = await err.response.json(); } catch {}
+        const msg = body.message || 'Server initialization failed';
+        renderLoading(msg);
         throw new Error(msg);
       }
-      if (!r.ok) {
-        throw new Error('Unexpected server response: ' + r.status);
+      if (err && err.name === 'TypeError') {
+        // fetch() rejects with TypeError on network failure (server shutdown during init).
+        renderLoading('Server disconnected');
+        throw new Error('Server disconnected');
       }
-      return r;
+      throw err;
     }
   }
 
@@ -885,8 +880,8 @@
       '<div class="loading" style="padding: 40px; text-align: center; color: var(--crit-editor-fg-muted);">Loading...</div>';
 
     const [sessionRes, configRes] = await Promise.all([
-      fetchWhenReady('/api/session?scope=' + enc(diffScope)).then(r => r.json()),
-      fetchWhenReady('/api/config').then(r => r.json()),
+      fetchWhenReady('/api/session?scope=' + enc(diffScope)),
+      fetchWhenReady('/api/config'),
     ]);
 
     session = sessionRes;
@@ -1037,7 +1032,7 @@
         setSetting('diffScope', 'all');
         // Re-fetch session with corrected scope — the initial fetch used the
         // stale cookie value and may have returned an empty file list.
-        const corrected = await fetchWhenReady('/api/session?scope=all').then(r => r.json());
+        const corrected = await fetchWhenReady('/api/session?scope=all');
         session = corrected;
         reviewComments = corrected.review_comments || [];
       }
@@ -1716,26 +1711,13 @@
     });
   }
 
-  function escapeHtml(str) {
-    return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-  }
-
-  function relativeTime(dateStr) {
-    const now = Date.now();
-    const then = new Date(dateStr).getTime();
-    const diff = Math.floor((now - then) / 1000);
-    if (diff < 60) return 'just now';
-    if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
-    if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
-    if (diff < 604800) return Math.floor(diff / 86400) + 'd ago';
-    return Math.floor(diff / 604800) + 'w ago';
-  }
-
-  function formatTime(isoStr) {
-    if (!isoStr) return '';
-    const d = new Date(isoStr);
-    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  }
+  // Pure rendering helpers live in crit-comment-card-helpers.js so design-mode
+  // rows render with the same primitives. The helpers module is loaded before
+  // app.js via index.html script order, so we reference it directly.
+  const _ccHelpers = window.crit.commentCardHelpers;
+  const escapeHtml = _ccHelpers.escapeHtml;
+  const relativeTime = _ccHelpers.relativeTime;
+  const formatTime = _ccHelpers.formatTime;
 
   function getFileByPath(path) {
     return files.find(f => f.path === path);
@@ -4806,72 +4788,21 @@
   }
 
   // ===== Comment Templates =====
-  function getTemplates() {
-    try {
-      const raw = getCookie('crit-templates');
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) return parsed;
-      }
-    } catch {}
-    return [];
-  }
-
-  function saveTemplates(templates) {
-    setCookie('crit-templates', JSON.stringify(templates));
-  }
-
-  function populateTemplateBar(bar, textarea) {
-    bar.innerHTML = '';
-    const templates = getTemplates();
-    if (templates.length === 0) {
-      bar.style.display = 'none';
-      return;
-    }
-    bar.style.display = '';
-    templates.forEach(function(tmpl, i) {
-      const chip = document.createElement('button');
-      chip.className = 'template-chip';
-      chip.title = tmpl;
-      const label = document.createElement('span');
-      label.className = 'template-chip-label';
-      label.textContent = tmpl;
-      chip.appendChild(label);
-      const del = document.createElement('span');
-      del.className = 'template-chip-delete';
-      del.textContent = '\u00d7';
-      del.title = 'Remove template';
-      del.addEventListener('click', function(e) {
-        e.preventDefault();
-        e.stopPropagation();
-        const t = getTemplates();
-        t.splice(i, 1);
-        saveTemplates(t);
-        populateTemplateBar(bar, textarea);
-      });
-      chip.appendChild(del);
-      chip.addEventListener('click', function(e) {
-        e.preventDefault();
-        const start = textarea.selectionStart;
-        const end = textarea.selectionEnd;
-        textarea.value = textarea.value.substring(0, start) + tmpl + textarea.value.substring(end);
-        textarea.selectionStart = textarea.selectionEnd = start + tmpl.length;
-        textarea.focus();
-        textarea.dispatchEvent(new Event('input'));
-      });
-      bar.appendChild(chip);
-    });
-  }
-
-  function createTemplateBar(textarea) {
-    const bar = document.createElement('div');
-    bar.className = 'comment-template-bar';
-    populateTemplateBar(bar, textarea);
-    return bar;
-  }
+  // Template CRUD and bar DOM delegated to window.crit.commentTemplates (crit-comment-templates.js).
 
   function attachTemplateUI(form, textarea, actions) {
-    const templateBar = createTemplateBar(textarea);
+    const tmplModule = window.crit.commentTemplates;
+
+    const templateBar = tmplModule.buildTemplateBar({
+      onInsert: function(text) {
+        const start = textarea.selectionStart;
+        const end = textarea.selectionEnd;
+        textarea.value = textarea.value.substring(0, start) + text + textarea.value.substring(end);
+        textarea.selectionStart = textarea.selectionEnd = start + text.length;
+        textarea.focus();
+        textarea.dispatchEvent(new Event('input'));
+      }
+    });
 
     const saveTemplateBtn = document.createElement('button');
     saveTemplateBtn.className = 'btn btn-sm';
@@ -4883,7 +4814,7 @@
 
     const suggestBtn = document.createElement('button');
     suggestBtn.className = 'btn btn-sm';
-    suggestBtn.textContent = '\u00B1 Suggest';
+    suggestBtn.textContent = '± Suggest';
     suggestBtn.title = 'Insert the selected lines as a suggestion';
     suggestBtn.addEventListener('click', function() { insertSuggestion(textarea); });
 
@@ -4936,11 +4867,8 @@
     saveBtn.addEventListener('click', function() {
       const val = input.value.trim();
       if (!val) return;
-      const t = getTemplates();
-      t.push(val);
-      saveTemplates(t);
+      templateBar._saveNew(val);
       overlay.remove();
-      populateTemplateBar(templateBar, textarea);
       textarea.focus();
     });
 
@@ -5566,51 +5494,42 @@
     renderFileByPath(formObj.filePath);
   }
 
-  // ===== Draft Autosave =====
-  const draftTimers = {};
-
-  function getDraftKey(formObj) {
-    if (!formObj) return null;
-    return 'crit-draft-' + formObj.formKey;
-  }
+  // ===== Draft Autosave (delegates to window.crit.draft) =====
+  const draftMod = window.crit.draft;
 
   function saveDraft(body, formObj) {
     if (!formObj) return;
-    const key = getDraftKey(formObj);
-    if (!key) return;
-    try {
-      localStorage.setItem(key, JSON.stringify({
-        filePath: formObj.filePath,
-        startLine: formObj.startLine,
-        endLine: formObj.endLine,
-        afterBlockIndex: formObj.afterBlockIndex,
-        editingId: formObj.editingId,
-        side: formObj.side || '',
-        scope: formObj.scope || '',
-        body: body,
-        savedAt: Date.now()
-      }));
-    } catch {}
+    draftMod.saveDraftImmediate(formObj.formKey, {
+      filePath: formObj.filePath,
+      startLine: formObj.startLine,
+      endLine: formObj.endLine,
+      afterBlockIndex: formObj.afterBlockIndex,
+      editingId: formObj.editingId,
+      side: formObj.side || '',
+      scope: formObj.scope || '',
+      body: body,
+      savedAt: Date.now()
+    });
   }
 
   function debouncedSaveDraft(body, formObj) {
     if (!formObj) return;
-    const key = formObj.formKey;
-    clearTimeout(draftTimers[key]);
-    draftTimers[key] = setTimeout(function() { saveDraft(body, formObj); }, 500);
+    draftMod.saveDraft(formObj.formKey, {
+      filePath: formObj.filePath,
+      startLine: formObj.startLine,
+      endLine: formObj.endLine,
+      afterBlockIndex: formObj.afterBlockIndex,
+      editingId: formObj.editingId,
+      side: formObj.side || '',
+      scope: formObj.scope || '',
+      body: body,
+      savedAt: Date.now()
+    });
   }
 
   function clearDraft(formObj) {
     if (!formObj) return;
-    const key = formObj.formKey;
-    if (draftTimers[key]) {
-      clearTimeout(draftTimers[key]);
-      delete draftTimers[key];
-    }
-    const draftKey = getDraftKey(formObj);
-    if (draftKey) {
-      try { localStorage.removeItem(draftKey); } catch {}
-    }
+    draftMod.clearDraft(formObj.formKey);
   }
 
   window.addEventListener('beforeunload', function() {
@@ -5618,6 +5537,7 @@
       const el = document.querySelector('.comment-form[data-form-key="' + formObj.formKey + '"] textarea');
       if (el) saveDraft(el.value, formObj);
     });
+    draftMod.flushAll();
   });
 
   function restoreDrafts() {
@@ -5689,16 +5609,13 @@
     }
   }
 
+  // Thin wrapper kept for existing call sites; delegates to the unified
+  // crit.shared.showToast helper (defined in crit-shared.js, also used by
+  // design-mode.js).
   function showMiniToast(message) {
-    const t = document.createElement('div');
-    t.className = 'mini-toast';
-    t.textContent = message;
-    document.body.appendChild(t);
-    requestAnimationFrame(function() { t.classList.add('mini-toast-visible'); });
-    setTimeout(function() {
-      t.classList.remove('mini-toast-visible');
-      setTimeout(function() { t.remove(); }, 300);
-    }, 3000);
+    if (window.crit && window.crit.shared && window.crit.shared.showToast) {
+      window.crit.shared.showToast(message);
+    }
   }
 
   // ===== Agent Button =====
@@ -5730,200 +5647,39 @@
     return env;
   }
 
-  // Shared helper for building comment card skeleton (header, body, replies)
+  // Shared helper for building comment card skeleton (header, body, replies).
+  // Code-review-internal callers pass a sparse opts object; this wrapper
+  // injects the module-scoped deps and the default override callbacks. The
+  // real implementation lives in frontend/crit-comment-card.js so design-mode
+  // can mount the same renderer with its own deps.
   function buildCommentCard(comment, filePath, opts) {
-    // opts: { wrapperClass, cardClassExtra, collapseDefault, showLineRef, showCarriedForward, repliesExtraClass, showReplyInput }
-    const wrapper = document.createElement('div');
-    wrapper.className = opts.wrapperClass || 'comment-block';
-
-    const card = document.createElement('div');
-    let cardClass = 'comment-card';
-    if (opts.cardClassExtra) cardClass += ' ' + opts.cardClassExtra;
-    card.className = cardClass;
-    card.dataset.commentId = comment.id;
-
-    // Collapse state — live threads stay expanded unless resolved
-    const liveOrPending = !comment.resolved && (isLiveThread(comment) || pendingAgentRequests.has(comment.id));
-    const isCollapsed = liveOrPending ? false
-      : opts.collapseDefault
-        ? (commentCollapseOverrides[comment.id] !== undefined ? commentCollapseOverrides[comment.id] : true)
-        : (commentCollapseOverrides[comment.id] === true);
-    if (isCollapsed) card.classList.add('collapsed');
-
-    const header = document.createElement('div');
-    header.className = 'comment-header';
-
-    const collapseBtn = document.createElement('button');
-    collapseBtn.className = 'comment-collapse-btn';
-    collapseBtn.title = isCollapsed ? 'Expand comment' : 'Collapse comment';
-    collapseBtn.innerHTML = ICON_CHEVRON;
-    collapseBtn.addEventListener('click', function(e) {
-      e.stopPropagation();
-      card.classList.toggle('collapsed');
-      commentCollapseOverrides[comment.id] = card.classList.contains('collapsed');
-      collapseBtn.title = card.classList.contains('collapsed') ? 'Expand comment' : 'Collapse comment';
-    });
-
-    const headerLeft = document.createElement('div');
-    headerLeft.className = 'comment-header-left';
-    headerLeft.prepend(collapseBtn);
-    if (comment.author) {
-      const authorBadge = document.createElement('span');
-      authorBadge.className = 'comment-author-badge author-color-' + authorColorIndex(comment.author);
-      authorBadge.textContent = '@' + comment.author;
-      headerLeft.appendChild(authorBadge);
+    opts = opts || {};
+    const merged = Object.assign({}, opts);
+    if (typeof merged.isPendingAgentRequest !== 'function') {
+      merged.isPendingAgentRequest = function (id) { return pendingAgentRequests.has(id); };
     }
-    if (comment.review_round >= 1) {
-      const roundBadge = document.createElement('span');
-      const rc = comment.review_round === session.review_round ? ' round-current' : comment.review_round === session.review_round - 1 ? ' round-latest' : '';
-      roundBadge.className = 'comment-round-badge' + rc;
-      roundBadge.textContent = 'R' + comment.review_round;
-      headerLeft.appendChild(roundBadge);
+    if (typeof merged.getCollapseOverride !== 'function') {
+      merged.getCollapseOverride = function (id) { return commentCollapseOverrides[id]; };
     }
-    if (opts.showLineRef && comment.scope !== 'file') {
-      const lineRef = document.createElement('span');
-      lineRef.className = 'comment-line-ref';
-      lineRef.textContent = comment.start_line === comment.end_line
-        ? 'Line ' + comment.start_line
-        : 'Lines ' + comment.start_line + '-' + comment.end_line;
-      headerLeft.appendChild(lineRef);
+    if (typeof merged.setCollapseOverride !== 'function') {
+      merged.setCollapseOverride = function (id, val) { commentCollapseOverrides[id] = val; };
     }
-    const time = document.createElement('span');
-    time.className = 'comment-time';
-    time.textContent = formatTime(comment.created_at);
-    headerLeft.appendChild(time);
-
-    if (liveOrPending) {
-      const badge = document.createElement('span');
-      badge.className = 'live-thread-badge' + (pendingAgentRequests.has(comment.id) ? ' pulsing' : '');
-      badge.innerHTML = '<svg viewBox="0 0 24 24" width="10" height="10" fill="currentColor" style="vertical-align: -1px"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10"/></svg> live';
-      headerLeft.appendChild(badge);
+    if (typeof merged.isLiveThread !== 'function') {
+      merged.isLiveThread = isLiveThread;
     }
-
-    if (comment.drifted) {
-      wrapper.classList.add('outdated-comment');
-      const driftedBadge = document.createElement('span');
-      driftedBadge.className = 'outdated-badge';
-      driftedBadge.textContent = 'Drifted';
-      headerLeft.appendChild(driftedBadge);
-    }
-
-    const actions = document.createElement('div');
-    actions.className = 'comment-actions';
-
-    header.appendChild(headerLeft);
-    header.appendChild(actions);
-
-    const bodyEl = document.createElement('div');
-    bodyEl.className = 'comment-body';
-    bodyEl.innerHTML = commentMd.render(comment.body, filePath ? buildCommentEnv(comment, filePath) : undefined);
-    linkifyCommentRefsInDom(bodyEl);
-
-    card.appendChild(header);
-
-    // Drifted anchor context — show original content that was commented on
-    if (comment.drifted && comment.anchor) {
-      const driftedCtx = document.createElement('div');
-      driftedCtx.className = 'drifted-context';
-
-      const toggle = document.createElement('button');
-      toggle.className = 'drifted-toggle';
-      toggle.type = 'button';
-
-      const chevron = document.createElement('span');
-      chevron.className = 'drifted-chevron';
-      chevron.innerHTML = '<svg viewBox="0 0 10 10" width="10" height="10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3.5,1.5 7,5 3.5,8.5"/></svg>';
-
-      const toggleLabel = document.createElement('span');
-      toggleLabel.className = 'drifted-toggle-label';
-      toggleLabel.textContent = 'Referenced content at time of review';
-
-      const anchorLines = comment.anchor.split('\n');
-      const toggleMeta = document.createElement('span');
-      toggleMeta.className = 'drifted-toggle-meta';
-      toggleMeta.textContent = anchorLines.length === 1 ? '1 line' : anchorLines.length + ' lines';
-
-      toggle.appendChild(chevron);
-      toggle.appendChild(toggleLabel);
-      toggle.appendChild(toggleMeta);
-
-      // Panel with CSS grid animation wrapper
-      const panelId = 'drifted-panel-' + comment.id;
-      const wrapper = document.createElement('div');
-      wrapper.className = 'drifted-panel-wrapper';
-      const inner = document.createElement('div');
-      inner.className = 'drifted-panel-inner';
-      const panel = document.createElement('div');
-      panel.className = 'drifted-panel';
-      panel.id = panelId;
-
-      // Render anchor text with line numbers
-      const pre = document.createElement('pre');
-      pre.className = 'drifted-anchor-text';
-      const startLine = comment.start_line || 1;
-      anchorLines.forEach(function(line, i) {
-        const lineEl = document.createElement('span');
-        lineEl.className = 'drifted-line';
-        const numEl = document.createElement('span');
-        numEl.className = 'drifted-line-number';
-        numEl.textContent = String(startLine + i);
-        const contentEl = document.createElement('span');
-        contentEl.className = 'drifted-line-content';
-        contentEl.textContent = line;
-        lineEl.appendChild(numEl);
-        lineEl.appendChild(contentEl);
-        pre.appendChild(lineEl);
-      });
-
-      panel.appendChild(pre);
-      inner.appendChild(panel);
-      wrapper.appendChild(inner);
-
-      toggle.setAttribute('aria-expanded', 'false');
-      toggle.setAttribute('aria-controls', panelId);
-      toggle.addEventListener('click', function() {
-        const isExpanded = driftedCtx.classList.contains('expanded');
-        driftedCtx.classList.toggle('expanded', !isExpanded);
-        toggle.setAttribute('aria-expanded', String(!isExpanded));
-      });
-
-      driftedCtx.appendChild(toggle);
-      driftedCtx.appendChild(wrapper);
-      card.appendChild(driftedCtx);
-    }
-
-    card.appendChild(bodyEl);
-
-    // Render replies
-    if (comment.replies && comment.replies.length > 0) {
-      card.appendChild(renderReplyList(comment, filePath || '', opts.repliesExtraClass));
-    }
-
-    // Pending agent indicator
-    if (pendingAgentRequests.has(comment.id)) {
-      const pending = document.createElement('div');
-      pending.className = 'agent-pending-reply';
-      pending.dataset.commentId = comment.id;
-      pending.innerHTML =
-        '<span class="agent-pending-author">@' + agentName + '</span>' +
-        '<span class="agent-pending-cursor">_</span>';
-      card.appendChild(pending);
-    }
-
-    // Reply input (filePath empty/null → review-level reply)
-    if (opts.showReplyInput) {
-      card.appendChild(createReplyInput(comment.id, filePath || ''));
-    }
-
-    if (pendingAgentRequests.has(comment.id) || isLiveThread(comment)) {
-      wrapper.classList.add('live-thread');
-    }
-    if (pendingAgentRequests.has(comment.id)) {
-      wrapper.classList.add('agent-pending');
-    }
-
-    wrapper.appendChild(card);
-    return { wrapper: wrapper, card: card, actions: actions };
+    merged.deps = Object.assign({
+      commentMd: commentMd,
+      formatTime: formatTime,
+      authorColorIndex: authorColorIndex,
+      getReviewRound: function () { return session && session.review_round; },
+      getAgentName: function () { return agentName; },
+      buildCommentEnv: buildCommentEnv,
+      renderReplyList: renderReplyList,
+      createReplyInput: createReplyInput,
+      iconChevron: ICON_CHEVRON,
+      linkifyDom: linkifyCommentRefsInDom,
+    }, opts.deps || {});
+    return window.crit.commentCard.buildCommentCard(comment, filePath, merged);
   }
 
   function createCommentElement(comment, filePath) {
@@ -5936,7 +5692,6 @@
       cardClassExtra: comment.carried_forward ? 'carried-forward' : '',
       collapseDefault: false,
       showLineRef: true,
-      showCarriedForward: true,
       showReplyInput: true,
     });
 
@@ -6450,7 +6205,6 @@
       cardClassExtra: cardClassExtra,
       collapseDefault: isResolved,
       showLineRef: false,
-      showCarriedForward: true,
       showReplyInput: true,
     });
 
@@ -6923,7 +6677,6 @@
       cardClassExtra: 'resolved-card',
       collapseDefault: true,
       showLineRef: true,
-      showCarriedForward: false,
       showReplyInput: true,
     });
 
@@ -6963,26 +6716,7 @@
       if (c.resolved) resolved++; else unresolved++;
     }
     const total = unresolved + resolved;
-    const navGroup = document.getElementById('commentNavGroup');
-    const el = document.getElementById('commentCount');
-    const numEl = document.getElementById('commentCountNumber');
-    if (total === 0) {
-      if (navGroup) navGroup.style.display = '';
-      if (navGroup) navGroup.classList.remove('has-comments');
-      el.classList.add('comment-count-resolved');
-      el.title = 'Toggle comments panel';
-      numEl.textContent = '';
-    } else if (unresolved > 0) {
-      if (navGroup) { navGroup.style.display = ''; navGroup.classList.add('has-comments'); }
-      el.classList.remove('comment-count-resolved');
-      el.title = unresolved + ' unresolved comment' + (unresolved === 1 ? '' : 's') + ' — toggle panel';
-      numEl.textContent = unresolved;
-    } else {
-      if (navGroup) { navGroup.style.display = ''; navGroup.classList.add('has-comments'); }
-      el.classList.add('comment-count-resolved');
-      el.title = total + ' resolved comment' + (total === 1 ? '' : 's') + ' — toggle panel';
-      numEl.textContent = total;
-    }
+    window.crit.shared.updateCommentCountIndicator({ totalCount: total, openCount: unresolved });
     renderCommentsPanel();
     if (uiState === 'reviewing') {
       document.getElementById('finishBtn').textContent = unresolved === 0 ? 'Approve' : 'Finish Review';
@@ -7030,7 +6764,6 @@
       cardClassExtra: cardClassExtra,
       collapseDefault: isResolved,
       showLineRef: !isGeneral,
-      showCarriedForward: true,
       repliesExtraClass: 'panel-replies',
       showReplyInput: false,
     });
@@ -7250,6 +6983,7 @@
     updateExpandAllLabel();
   }
 
+
   function scrollToComment(commentId, filePath) {
     // 1. Find the file section and expand if collapsed
     const section = document.getElementById('file-section-' + filePath);
@@ -7270,6 +7004,7 @@
     commentCard.addEventListener('animationend', function() {
       commentCard.classList.remove('comment-card-highlight');
     }, { once: true });
+
   }
 
   // ===== PR Overview Panel =====
@@ -7411,56 +7146,19 @@
   }
 
   // ===== Waiting Modal Tips =====
-  const waitingTips = [
-    'Press <kbd>?</kbd> to see all keyboard shortcuts.',
-    'Comments support full Markdown.',
-    'Press <kbd>@</kbd> to reference other files in your comments.',
-    'Select text and press <kbd>c</kbd> to comment on your selection.',
-    'Use <kbd>crit pull</kbd> to load existing GitHub PR comments into your local review.',
-    'Use <kbd>crit push</kbd> to post your comments as a GitHub PR review. Add <kbd>--dry-run</kbd> to preview first.',
-    'Enjoying Crit? A GitHub star or sharing it with colleagues helps a lot!',
-  ];
-  let tipInterval = null;
-  let lastTip = '';
-
-  function buildTips() {
-    const tips = waitingTips.slice();
+  function startTipRotation() {
+    const extra = [];
     if (!agentEnabled) {
-      tips.push('Set <kbd>agent_cmd</kbd> in your config to send comments directly to your AI agent for immediate feedback.');
+      extra.push('Set <kbd>agent_cmd</kbd> in your config to send comments directly to your AI agent for immediate feedback.');
     }
     if (shareURL && !authUserName) {
-      tips.push('Run <kbd>crit auth login</kbd> to link shared reviews with your account.');
+      extra.push('Run <kbd>crit auth login</kbd> to link shared reviews with your account.');
     }
-    return tips;
-  }
-
-  function showRandomTip() {
-    const el = document.getElementById('tipText');
-    if (!el) return;
-    const tips = buildTips();
-    if (tips.length === 0) return;
-    let idx;
-    do {
-      idx = Math.floor(Math.random() * tips.length);
-    } while (tips[idx] === lastTip && tips.length > 1);
-    lastTip = tips[idx];
-    el.style.animation = 'none';
-    void el.offsetWidth;
-    el.innerHTML = tips[idx];
-    el.style.animation = '';
-  }
-
-  function startTipRotation() {
-    if (tipInterval) return;
-    showRandomTip();
-    tipInterval = setInterval(showRandomTip, 8000);
+    window.crit.shared.startTipRotation(extra);
   }
 
   function stopTipRotation() {
-    if (tipInterval) {
-      clearInterval(tipInterval);
-      tipInterval = null;
-    }
+    window.crit.shared.stopTipRotation();
   }
 
   // ===== UI State =====
@@ -7508,46 +7206,18 @@
   // ===== General Comment Button (in panel header) =====
 
   // ===== Finish Review =====
+  // The DOM/clipboard/animation logic lives in crit.shared.runFinishReview;
+  // this thin wrapper preserves the app.js-specific waitingNotApproved flag
+  // and uiState transition (design-mode wires its own state machine).
   async function doFinishReview() {
-    try {
-      const resp = await fetch('/api/finish', { method: 'POST' });
-      if (!resp.ok) {
-        throw new Error('Finish review failed: HTTP ' + resp.status);
-      }
-      const data = await resp.json();
-      const approved = !!data.approved;
-      waitingNotApproved = !approved;
-      const prompt = data.prompt || '';
-
-      const dialog = document.getElementById('waitingDialog');
-      const headingEl = document.getElementById('waitingHeading');
-      const messageEl = document.getElementById('waitingMessage');
-      const clipEl = document.getElementById('waitingClipboard');
-
-      document.getElementById('waitingPrompt').textContent = prompt;
-      document.getElementById('promptPreview').textContent = prompt;
-      clipEl.querySelector('.copy-label').textContent = 'Copy';
-      clipEl.classList.remove('copied');
-
-      // Replay the success-mark draw animation each time we enter approved state.
-      dialog.classList.remove('approved');
-      if (approved) {
-        void dialog.offsetWidth; // force reflow — restarts CSS animations on re-added class
-        dialog.classList.add('approved');
-        headingEl.textContent = 'Approved';
-        messageEl.textContent =
-          'Your agent has been notified \u2014 no further action needed. You can close this tab whenever you\u2019re ready.';
-      } else {
-        headingEl.textContent = 'Review Complete';
-        messageEl.textContent = 'Agent notified. Copy the prompt below if it wasn’t listening.';
-      }
-
-      try { await navigator.clipboard.writeText(prompt); } catch {}
-      setUIState('waiting');
-    } catch (err) {
-      console.error('Error finishing review:', err);
-      showMiniToast('Failed to finish review');
-    }
+    return await window.crit.shared.runFinishReview({
+      onApproved: function () { waitingNotApproved = false; setUIState('waiting'); },
+      onWaiting: function () { waitingNotApproved = true; setUIState('waiting'); },
+      onError: function (err) {
+        console.error('Error finishing review:', err);
+        showMiniToast('Failed to finish review');
+      },
+    });
   }
 
   async function resolveAllAndFinish() {
@@ -7661,9 +7331,10 @@
   // ===== SSE Client =====
 
   function connectSSE() {
-    const source = new EventSource('/api/events');
+    let sseErrorCount = 0;
 
-    source.addEventListener('file-changed', async function() {
+    const conn = window.crit.sse.createSSE('/api/events', {
+      'file-changed': async function() {
       try {
         // Reset action tracking for new round
         userActedThisRound = false;
@@ -7736,11 +7407,9 @@
       } catch (err) {
         console.error('Error handling file-changed:', err);
       }
-    });
-
-    source.addEventListener('edit-detected', function(e) {
+      },
+      'edit-detected': function(data) {
       try {
-        const data = JSON.parse(e.data);
         const count = parseInt(data.content, 10);
         const el = document.getElementById('waitingEdits');
         if (el && uiState === 'waiting') {
@@ -7755,9 +7424,8 @@
           }
         }
       } catch {}
-    });
-
-    source.addEventListener('comments-changed', async function() {
+      },
+      'comments-changed': async function() {
       try {
         // Only re-fetch comments data, not file content or diffs (those only
         // change on file-changed events). This reduces O(3N) to O(N) requests.
@@ -7804,19 +7472,17 @@
       } catch (err) {
         console.error('Error handling comments-changed:', err);
       }
-    });
-
-    source.addEventListener('base-changed', function() {
+      },
+      'base-changed': function() {
       reloadForScope();
       fetchCommits();
-    });
-
-    source.addEventListener('focus-changed', function(e) {
+      },
+      'focus-changed': function(data) {
       try {
         // Server SSE wraps every event in {type, filename, content} where
         // `content` is a JSON string carrying the actual payload. Parse the
         // SSE envelope first, then the inner content for the focus object.
-        const envelope = JSON.parse(e.data || '{}');
+        const envelope = data || {};
         const inner = envelope.content ? JSON.parse(envelope.content) : envelope;
         const focus = inner && inner.focus;
         if (focus) {
@@ -7842,61 +7508,29 @@
       // Reuse the same refresh path as base-changed.
       reloadForScope();
       fetchCommits();
-    });
-
-    source.addEventListener('server-shutdown', function() {
-      source.close();
+      },
+      'server-shutdown': function() {
+      conn.close();
       showDisconnected();
+      },
+    }, {
+      onError: function() {
+        sseErrorCount++;
+        if (sseErrorCount >= 3) {
+          showMiniToast('Connection lost \u2014 retrying\u2026');
+        }
+      },
     });
 
-    let sseErrorCount = 0;
-    source.addEventListener('message', function() { sseErrorCount = 0; });
-    source.addEventListener('file-changed', function() { sseErrorCount = 0; });
-    source.addEventListener('comments-changed', function() { sseErrorCount = 0; });
-    source.addEventListener('base-changed', function() { sseErrorCount = 0; });
-
-    source.onerror = function() {
-      sseErrorCount++;
-      if (sseErrorCount >= 3) {
-        showMiniToast('Connection lost \u2014 retrying\u2026');
-      }
-    };
+    // Reset error count on successful events by wrapping source listeners
+    conn.source.addEventListener('message', function() { sseErrorCount = 0; });
+    conn.source.addEventListener('file-changed', function() { sseErrorCount = 0; });
+    conn.source.addEventListener('comments-changed', function() { sseErrorCount = 0; });
+    conn.source.addEventListener('base-changed', function() { sseErrorCount = 0; });
   }
 
   function showDisconnected() {
-    // Idempotent: bail if a banner is already present.
-    if (document.querySelector('.disconnected-banner')) return;
-
-    const header = document.querySelector('.header');
-    const banner = document.createElement('div');
-    banner.className = 'disconnected-banner';
-    banner.setAttribute('role', 'status');
-    banner.setAttribute('aria-live', 'polite');
-
-    const pill = document.createElement('div');
-    pill.className = 'disconnected-pill';
-    pill.innerHTML = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><circle cx="7" cy="7" r="6" fill="currentColor" opacity="0.18"/><circle cx="7" cy="7" r="6" stroke="currentColor" stroke-width="1.25"/><path d="M4.5 7.1 L6.3 8.9 L9.5 5.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>Session complete';
-
-    const text = document.createElement('span');
-    text.className = 'disconnected-text';
-    text.textContent = 'Server stopped \u2014 your review is now read only. Safe to close this tab.';
-
-    banner.appendChild(pill);
-    banner.appendChild(text);
-    header.insertAdjacentElement('afterend', banner);
-
-    // Sticky offset is driven by the --crit-header-height CSS variable, kept
-    // in sync by ResizeObserver below — no inline style, so resize is handled.
-    const setHeaderVar = function() {
-      document.documentElement.style.setProperty('--crit-header-height', header.offsetHeight + 'px');
-    };
-    setHeaderVar();
-    if (typeof ResizeObserver !== 'undefined') {
-      const ro = new ResizeObserver(setHeaderVar);
-      ro.observe(header);
-    } else {
-      window.addEventListener('resize', setHeaderVar);
-    }
+    window.crit.shared.showDisconnected();
   }
 
   // ===== Share =====
@@ -8987,64 +8621,18 @@
     SIDEBAR_RESIZE.forEach(function(cfg) {
       const target = document.getElementById(cfg.targetId);
       if (!target) return;
-      const saved = getSetting(cfg.settingKey, null);
-      if (typeof saved === 'number' && saved >= cfg.min) {
-        target.style.width = saved + 'px';
-      }
       const handle = document.getElementById(cfg.handleId);
-      if (handle) attachSidebarResizeHandle(handle, target, cfg);
-    });
-  }
-
-  function attachSidebarResizeHandle(handle, target, cfg) {
-    // Pointer events + setPointerCapture: the handle keeps receiving move/up
-    // events even if the pointer leaves the window, devtools opens, or the
-    // user alt-tabs. Avoids the "stuck dragging" leak that document-level
-    // mousemove listeners suffer from.
-    handle.addEventListener('pointerdown', function(e) {
-      if (e.button !== 0) return;
-      e.preventDefault();
-      handle.setPointerCapture(e.pointerId);
-      const startX = e.clientX;
-      const startWidth = target.getBoundingClientRect().width;
-      // For a left-edge handle (comments panel), dragging right shrinks the panel.
-      const dir = cfg.edge === 'left' ? -1 : 1;
-      handle.classList.add('dragging');
-      document.body.classList.add('sidebar-resizing');
-      let lastWidth = startWidth;
-
-      function onMove(ev) {
-        const delta = (ev.clientX - startX) * dir;
-        const w = Math.max(cfg.min, startWidth + delta);
-        target.style.width = w + 'px';
-        lastWidth = w;
-      }
-      function onEnd() {
-        handle.removeEventListener('pointermove', onMove);
-        handle.removeEventListener('pointerup', onEnd);
-        handle.removeEventListener('pointercancel', onEnd);
-        handle.classList.remove('dragging');
-        document.body.classList.remove('sidebar-resizing');
-        setSetting(cfg.settingKey, Math.round(lastWidth));
-      }
-      handle.addEventListener('pointermove', onMove);
-      handle.addEventListener('pointerup', onEnd);
-      handle.addEventListener('pointercancel', onEnd);
-    });
-
-    // Keyboard resize for a11y: ArrowLeft / ArrowRight nudges by 16px.
-    // For left-edge handles (comments panel) the direction flips so
-    // ArrowRight always shrinks the controlled panel — matching pointer
-    // drag semantics.
-    handle.addEventListener('keydown', function(e) {
-      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
-      e.preventDefault();
-      const dir = cfg.edge === 'left' ? -1 : 1;
-      const sign = e.key === 'ArrowRight' ? 1 : -1;
-      const current = target.getBoundingClientRect().width;
-      const w = Math.max(cfg.min, current + sign * dir * 16);
-      target.style.width = w + 'px';
-      setSetting(cfg.settingKey, Math.round(w));
+      if (!handle) return;
+      // Pointer capture, body.sidebar-resizing class, persistence, min clamp,
+      // and keyboard a11y all live in the shared helper. Both code-review
+      // handles (file-tree, comments-panel) and design-mode's comments-panel
+      // share the implementation so cursor-locking and keyboard nudge stay
+      // in lockstep across modes.
+      window.crit.shared.installSidebarResize(handle, target, {
+        settingKey: cfg.settingKey,
+        min: cfg.min,
+        edge: cfg.edge,
+      });
     });
   }
 
@@ -9552,84 +9140,44 @@
   });
 
   // ===== Settings Panel =====
+  // Open/close, focus trap, sliding underline, Esc/?, tab keyboard nav and
+  // click delegation are all owned by the shared settings-overlay shell
+  // (crit-settings-overlay.js). This file only supplies pane-render hooks
+  // (cfg fetch + renderSettingsPane/AboutPane/ShortcutsPane).
+  let settingsCtl = null;
+  function getSettingsCtl() {
+    if (settingsCtl) return settingsCtl;
+    const overlay = document.getElementById('settingsOverlay');
+    const toggle = document.getElementById('settingsToggle');
+    const closeBtn = document.getElementById('settingsClose');
+    if (!overlay || !window.crit || !window.crit.settingsOverlay) return null;
+    settingsCtl = window.crit.settingsOverlay.install({
+      overlay: overlay,
+      toggle: toggle,
+      closeBtn: closeBtn,
+      initialTab: 'settings',
+      onOpen: function (tab) {
+        settingsPanelOpen = true;
+        settingsPanelTab = tab || 'settings';
+        if (!cachedConfig) {
+          fetch('/api/config').then(function (r) { return r.json(); }).then(function (cfg) {
+            cachedConfig = cfg;
+            renderSettingsPane(cfg);
+            renderAboutPane(cfg);
+          });
+        }
+        renderShortcutsPane();
+      },
+      onTabSwitch: function (tab) { settingsPanelTab = tab; },
+      onClose: function () { settingsPanelOpen = false; },
+    });
+    return settingsCtl;
+  }
   function openSettingsPanel(tab) {
     settingsPanelTab = tab || 'settings';
     settingsPanelOpen = true;
-    const overlay = document.getElementById('settingsOverlay');
-    overlay.classList.add('active');
-    // Ensure the sliding underline element exists
-    if (!overlay.querySelector('.settings-tab-underline')) {
-      const underline = document.createElement('div');
-      underline.className = 'settings-tab-underline';
-      overlay.querySelector('.settings-tabs').appendChild(underline);
-    }
-    switchSettingsTab(settingsPanelTab);
-    // Fetch config if not cached
-    if (!cachedConfig) {
-      fetch('/api/config').then(function(r) { return r.json(); }).then(function(cfg) {
-        cachedConfig = cfg;
-        renderSettingsPane(cfg);
-        renderAboutPane(cfg);
-      });
-    }
-    renderShortcutsPane();
-    // Trap focus inside the settings dialog
-    trapFocusIn(overlay);
-  }
-
-  let focusTrapCleanup = null;
-
-  function trapFocusIn(container) {
-    releaseFocusTrap();
-    function handler(e) {
-      if (e.key !== 'Tab') return;
-      const focusable = container.querySelectorAll('button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])');
-      if (focusable.length === 0) return;
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      if (e.shiftKey) {
-        if (document.activeElement === first) { e.preventDefault(); last.focus(); }
-      } else {
-        if (document.activeElement === last) { e.preventDefault(); first.focus(); }
-      }
-    }
-    container.addEventListener('keydown', handler);
-    focusTrapCleanup = function() { container.removeEventListener('keydown', handler); };
-    // Focus the first focusable element
-    const firstFocusable = container.querySelector('button:not([disabled]), [href], input:not([disabled])');
-    if (firstFocusable) requestAnimationFrame(function() { firstFocusable.focus(); });
-  }
-
-  function releaseFocusTrap() {
-    if (focusTrapCleanup) { focusTrapCleanup(); focusTrapCleanup = null; }
-  }
-
-  function closeSettingsPanel() {
-    settingsPanelOpen = false;
-    releaseFocusTrap();
-    document.getElementById('settingsOverlay').classList.remove('active');
-  }
-
-  function switchSettingsTab(tab) {
-    settingsPanelTab = tab;
-    let activeBtn = null;
-    document.querySelectorAll('.settings-tab[role="tab"]').forEach(function(t) {
-      const isActive = t.dataset.tab === tab;
-      t.classList.toggle('active', isActive);
-      t.setAttribute('aria-selected', String(isActive));
-      if (isActive) activeBtn = t;
-    });
-    document.querySelectorAll('.settings-pane').forEach(function(p) {
-      p.classList.toggle('active', p.dataset.pane === tab);
-    });
-    // Position the sliding underline
-    const underline = document.querySelector('.settings-tab-underline');
-    if (underline && activeBtn) {
-      const tabsRect = activeBtn.parentElement.getBoundingClientRect();
-      const btnRect = activeBtn.getBoundingClientRect();
-      underline.style.left = (btnRect.left - tabsRect.left) + 'px';
-      underline.style.width = btnRect.width + 'px';
-    }
+    const ctl = getSettingsCtl();
+    if (ctl) ctl.open(settingsPanelTab);
   }
 
   function applyHideResolved() {
@@ -9650,12 +9198,29 @@
 
   function renderSettingsPane(cfg) {
     const pane = document.getElementById('settingsPane');
+    const shared = window.crit && window.crit.settingsPanes;
+    if (shared && shared.renderSettingsTab) {
+      shared.renderSettingsTab(pane, {
+        mode: 'code-review',
+        cfg: cfg,
+        hooks: {
+          applyTheme: window.applyTheme,
+          applyWidth: applyWidth,
+          getHideResolved: isHideResolved,
+          setHideResolved: setHideResolved,
+          onHideResolvedChange: function () { renderAllFiles(); },
+          hasActivePendingUpdates: hasActivePendingUpdates,
+          announceCopy: announceCopy,
+          escape: escapeHtml,
+        },
+      });
+      return;
+    }
+    // Fallback (shared module not loaded — should never happen since
+    // crit-settings-panes.js is loaded before app.js).
     const currentTheme = getSetting('theme', 'system');
     const currentWidth = getSetting('width', 'default');
-
     let html = '';
-
-    // Display section
     html += '<div class="settings-section-label">Display</div>';
     html += '<div class="settings-display-group">';
 
@@ -9930,130 +9495,22 @@
   }
 
   function renderShortcutsPane() {
-    const pane = document.getElementById('shortcutsPane');
-    let html = '';
-
-    const groups = [
-      { label: 'Navigation', shortcuts: [
-        { key: '<kbd>j</kbd>', action: 'Next block' },
-        { key: '<kbd>k</kbd>', action: 'Previous block' },
-        { key: '<kbd>Shift</kbd>+<kbd>V</kbd>', action: 'Visual line mode (extend with j/k, then c to comment)' },
-        { key: '<kbd>]</kbd>', action: 'Next comment' },
-        { key: '<kbd>[</kbd>', action: 'Previous comment' },
-        { key: '<kbd>n</kbd>', action: 'Next change', mode: 'file mode' },
-        { key: '<kbd>N</kbd>', action: 'Previous change', mode: 'file mode' },
-      ]},
-      { label: 'Comments', shortcuts: [
-        { key: '<kbd>c</kbd>', action: 'Comment on focused block (or text selection, with quote)' },
-        { key: '<kbd>e</kbd>', action: 'Edit comment on focused block' },
-        { key: '<kbd>d</kbd>', action: 'Delete comment on focused block' },
-        { key: '<kbd>G</kbd>', action: 'General comment' },
-        { key: '<kbd>Ctrl</kbd>+<kbd>Enter</kbd>', action: 'Comment' },
-      ]},
-      { label: 'Review', shortcuts: [
-        { key: '<kbd>Shift</kbd>+<kbd>F</kbd>', action: 'Finish review' },
-        { key: '<kbd>Shift</kbd>+<kbd>C</kbd>', action: 'Toggle comments panel' },
-        { key: '<kbd>Shift</kbd>+<kbd>1</kbd>/<kbd>2</kbd>/<kbd>3</kbd>/<kbd>4</kbd>', action: 'Switch scope', mode: 'vcs mode' },
-      ]},
-      { label: 'View', shortcuts: [
-        { key: '<kbd>t</kbd>', action: 'Toggle table of contents', mode: 'file mode' },
-        { key: '<kbd>h</kbd>', action: 'Toggle hide resolved' },
-        { key: '<kbd>Esc</kbd>', action: 'Cancel / clear focus' },
-        { key: '<kbd>?</kbd>', action: 'Toggle this panel' },
-      ]},
-    ];
-
-    groups.forEach(function(group) {
-      html += '<div class="shortcuts-group-label">' + group.label + '</div>';
-      html += '<table class="shortcuts-table">';
-      group.shortcuts.forEach(function(s) {
-        const modeTag = s.mode ? '<span class="shortcut-mode-badge">' + s.mode + '</span>' : '';
-        html += '<tr><td>' + s.key + '</td><td>' + s.action + modeTag + '</td></tr>';
-      });
-      html += '</table>';
-    });
-
-    pane.innerHTML = html;
+    const shared = window.crit && window.crit.settingsPanes;
+    if (shared && shared.renderShortcutsPane) {
+      shared.renderShortcutsPane(document.getElementById('shortcutsPane'), { mode: 'code-review' });
+    }
   }
 
   function renderAboutPane(cfg) {
-    const pane = document.getElementById('aboutPane');
-    let html = '';
-
-    // Version header
-    html += '<div class="about-header">';
-    html += '<h2>Crit</h2>';
-    const ver = cfg.version || 'dev';
-    html += '<div class="about-version">' + escapeHtml(ver) + '</div>';
-    if (!cfg.no_update_check) {
-      if (cfg.latest_version && cfg.version && cfg.latest_version !== cfg.version) {
-        html += '<div class="about-badge about-badge--update">Update available: ' + escapeHtml(cfg.latest_version) + '</div>';
-      } else if (cfg.version && cfg.version !== 'dev') {
-        html += '<div class="about-badge about-badge--current">Up to date</div>';
-      }
+    const shared = window.crit && window.crit.settingsPanes;
+    if (shared && shared.renderAboutPane) {
+      shared.renderAboutPane(document.getElementById('aboutPane'), cfg, session);
     }
-    html += '</div>';
-
-    // Session info
-    html += '<div class="settings-section-label">Current Session</div>';
-    html += '<div class="about-session"><div class="about-session-grid">';
-    html += '<span class="about-session-label">Mode</span><span class="about-session-value">' + (session.vcs_name || session.mode || 'unknown') + '</span>';
-    if (session.mode === 'git' && session.branch) {
-      html += '<span class="about-session-label">Branch</span><span class="about-session-value">' + escapeHtml(session.branch) + '</span>';
-    }
-    if (session.base_ref) {
-      html += '<span class="about-session-label">Base</span><span class="about-session-value">' + escapeHtml(session.base_branch_name || session.base_ref) + '</span>';
-    }
-    html += '<span class="about-session-label">Round</span><span class="about-session-value">' + (session.review_round || 1) + '</span>';
-    html += '<span class="about-session-label">Files</span><span class="about-session-value">' + (session.files ? session.files.length : 0) + ' changed</span>';
-    if (cfg.review_path) {
-      html += '<span class="about-session-label">Review file</span><span class="about-session-value"><code>' + escapeHtml(cfg.review_path) + '</code></span>';
-    }
-    html += '</div></div>';
-
-    // Links
-    html += '<div class="settings-section-label">Links</div>';
-    html += '<div class="about-links">';
-    html += '<a class="about-link" href="https://crit.md" target="_blank" rel="noopener"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 1v4M5.5 3h5M3 7h10v6.5a.5.5 0 0 1-.5.5h-9a.5.5 0 0 1-.5-.5V7Z"/></svg>Homepage</a>';
-    html += '<a class="about-link" href="https://github.com/tomasz-tomczyk/crit" target="_blank" rel="noopener"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z"/></svg>GitHub</a>';
-    html += '<a class="about-link" href="https://github.com/tomasz-tomczyk/crit/releases" target="_blank" rel="noopener"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M1 7.775V2.75C1 1.784 1.784 1 2.75 1h5.025c.464 0 .91.184 1.238.513l6.25 6.25a1.75 1.75 0 0 1 0 2.474l-5.026 5.026a1.75 1.75 0 0 1-2.474 0l-6.25-6.25A1.752 1.752 0 0 1 1 7.775Zm1.5 0c0 .066.026.13.073.177l6.25 6.25a.25.25 0 0 0 .354 0l5.025-5.025a.25.25 0 0 0 0-.354l-6.25-6.25a.25.25 0 0 0-.177-.073H2.75a.25.25 0 0 0-.25.25ZM6 5a1 1 0 1 1 0 2 1 1 0 0 1 0-2Z"/></svg>Changelog</a>';
-    html += '</div>';
-
-    pane.innerHTML = html;
   }
 
-  // Gear icon opens Settings tab
-  document.getElementById('settingsToggle').addEventListener('click', function() {
-    if (settingsPanelOpen) closeSettingsPanel();
-    else openSettingsPanel('settings');
-  });
-
-  // Close button
-  document.getElementById('settingsClose').addEventListener('click', closeSettingsPanel);
-
-  // Click outside to close
-  document.getElementById('settingsOverlay').addEventListener('click', function(e) {
-    if (e.target === this) closeSettingsPanel();
-  });
-
-  // Tab switching
-  document.querySelectorAll('.settings-tab[data-tab]').forEach(function(tab) {
-    tab.addEventListener('click', function() { switchSettingsTab(tab.dataset.tab); });
-  });
-
-  // Arrow key navigation for ARIA tabs pattern
-  document.querySelector('.settings-tabs[role="tablist"]').addEventListener('keydown', function(e) {
-    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
-    const tabs = Array.from(this.querySelectorAll('.settings-tab[data-tab]'));
-    const current = tabs.findIndex(function(t) { return t.getAttribute('aria-selected') === 'true'; });
-    if (current === -1) return;
-    let next = e.key === 'ArrowRight' ? current + 1 : current - 1;
-    if (next < 0) next = tabs.length - 1;
-    if (next >= tabs.length) next = 0;
-    e.preventDefault();
-    switchSettingsTab(tabs[next].dataset.tab);
-    tabs[next].focus();
-  });
+  // Settings overlay shell (open/close/Esc/?/focus-trap/sliding-underline/
+  // tab click + arrow nav) is owned by crit-settings-overlay.js.
+  getSettingsCtl();
 
   document.getElementById('noChangesOverlay').addEventListener('click', function(e) {
     if (e.target === this) hideNoChangesConfirm();
@@ -10081,17 +9538,9 @@
       return;
     }
 
-    if (settingsPanelOpen) {
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        closeSettingsPanel();
-      } else if (e.key === '?') {
-        e.preventDefault();
-        if (settingsPanelTab === 'shortcuts') closeSettingsPanel();
-        else switchSettingsTab('shortcuts');
-      }
-      return;
-    }
+    // Esc/? while settings overlay is open are owned by crit-settings-overlay.js;
+    // short-circuit the rest of the keymap so we don't double-handle.
+    if (settingsPanelOpen) return;
 
     if (e.metaKey || e.ctrlKey || e.altKey) return;
 
@@ -10283,6 +9732,7 @@
         break;
       }
       case '?': {
+        if (settingsPanelOpen) break;
         e.preventDefault();
         openSettingsPanel('shortcuts');
         break;
@@ -10918,6 +10368,64 @@
       }
     })
     .then(connectSSE)
+    .then(function() {
+      // Register as InlineContentRenderer
+      if (window.crit && window.crit.renderer) {
+        // eslint-disable-next-line no-unused-vars
+        let annotationIntentCb = null;
+
+        window.crit.renderer.register({
+          scrollToAnchor: function (anchor) {
+            if (anchor.type !== 'line') return Promise.resolve();
+            const section = document.getElementById('file-section-' + anchor.filePath);
+            if (!section) return Promise.resolve();
+            if (!section.open) section.open = true;
+            const el = section.querySelector('.line-block[data-file-path="' + CSS.escape(anchor.filePath) + '"][data-end-line="' + anchor.endLine + '"]');
+            if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            return Promise.resolve();
+          },
+
+          highlightAnchor: function (anchor) {
+            if (anchor.type !== 'line') return Promise.resolve();
+            const section = document.getElementById('file-section-' + anchor.filePath);
+            if (!section) return Promise.resolve();
+            const blocks = section.querySelectorAll('.line-block[data-file-path="' + CSS.escape(anchor.filePath) + '"]');
+            blocks.forEach(function (el) {
+              const start = parseInt(el.dataset.startLine);
+              const end = parseInt(el.dataset.endLine);
+              if (start >= anchor.startLine && end <= anchor.endLine) {
+                el.classList.remove('comment-card-highlight');
+                void el.offsetWidth;
+                el.classList.add('comment-card-highlight');
+                el.addEventListener('animationend', function () {
+                  el.classList.remove('comment-card-highlight');
+                }, { once: true });
+              }
+            });
+            return Promise.resolve();
+          },
+
+          clearHighlight: function () {
+            document.querySelectorAll('.line-block.comment-card-highlight').forEach(function (el) {
+              el.classList.remove('comment-card-highlight');
+            });
+          },
+
+          onAnnotationIntent: function (callback) {
+            annotationIntentCb = callback;
+            return function () { annotationIntentCb = null; };
+          },
+
+          getMode: function () {
+            return (session && session.mode) || 'files';
+          },
+
+          getAnchorType: function () {
+            return 'line';
+          },
+        });
+      }
+    })
     .catch(function(err) {
       console.error('Init failed:', err.message);
     });
