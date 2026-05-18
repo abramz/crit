@@ -1719,7 +1719,31 @@ func connectOrStartDaemon(key string, args []string, noOpen bool) (sessionEntry,
 		os.Exit(1)
 	}
 	fmt.Fprintf(os.Stderr, "Started crit daemon at http://localhost:%d (PID %d)\n", entry.Port, entry.PID)
+	hintMissingIntegrations()
 	return entry, true
+}
+
+// hintMissingIntegrations prints a suggestion when AI tools are detected but
+// no crit integration is installed. Skipped when any integration already exists
+// or when CRIT_NO_INTEGRATION_CHECK is set.
+func hintMissingIntegrations() {
+	if os.Getenv("CRIT_NO_INTEGRATION_CHECK") != "" {
+		return
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	hintMissingIntegrationsFor(mustGetwd(), home)
+}
+
+func hintMissingIntegrationsFor(cwd, home string) {
+	if len(installedAgents(cwd, home)) > 0 {
+		return
+	}
+	if missing := checkMissingIntegrations(cwd, home); len(missing) > 0 {
+		printMissingHints(missing)
+	}
 }
 
 func installDaemonSignalHandler(pid int) {
@@ -2106,6 +2130,9 @@ func runReview(args []string) {
 			os.Exit(1)
 		}
 		fmt.Fprintf(os.Stderr, "Started crit daemon at http://localhost:%d (PID %d)\n", entry.Port, entry.PID)
+		if !sc.noIntegrationCheck {
+			hintMissingIntegrations()
+		}
 		weStartedDaemon = true
 	}
 
