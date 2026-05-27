@@ -535,6 +535,26 @@
   let cachedConfig = null; // populated on first panel open
 
   let diffMode = getSetting('diffMode', 'split'); // 'split' or 'unified'
+  // Mobile viewports always render unified diffs. Split is unusable in <=768px
+  // because two columns of source code don't fit. The user's saved preference
+  // is preserved so it takes effect again above the breakpoint.
+  const mobileDiffQuery = window.matchMedia ? window.matchMedia('(max-width: 768px)') : null;
+  if (mobileDiffQuery && mobileDiffQuery.matches) {
+    diffMode = 'unified';
+  }
+  if (mobileDiffQuery) {
+    // Re-evaluate on viewport changes (tablet rotation, devtools resize).
+    // When crossing into mobile, force unified; when crossing back out,
+    // restore the user's saved preference. Re-render so the change is visible.
+    mobileDiffQuery.addEventListener('change', function(ev) {
+      if (ev.matches) {
+        diffMode = 'unified';
+      } else {
+        diffMode = getSetting('diffMode', 'split');
+      }
+      renderAllFiles();
+    });
+  }
   let diffScope = getSetting('diffScope', 'all'); // 'all', 'branch', 'staged', or 'unstaged'
 
   // Single source of truth for hide-resolved state. Persisted via the
@@ -1328,6 +1348,7 @@
     const panel = document.getElementById('fileTreePanel');
     if (files.length <= 1 && session.mode !== 'git') {
       panel.style.display = 'none';
+      renderMobileFilePicker();
       return;
     }
     panel.style.display = '';
@@ -1381,6 +1402,47 @@
 
     // Set up intersection observer for active file tracking
     setupTreeObserver();
+
+    renderMobileFilePicker();
+  }
+
+  // Mobile (≤768px) replaces the file-tree sidebar with a sticky <select>.
+  // Populates options from the current session files; clicking an option
+  // scrolls that file's section into view. No-op (and hidden) when there's
+  // only one file.
+  function renderMobileFilePicker() {
+    const bar = document.getElementById('mobileFilePickerBar');
+    const select = document.getElementById('mobileFilePicker');
+    if (!bar || !select) return;
+
+    if (files.length <= 1) {
+      bar.classList.add('mobile-file-picker-hidden');
+      return;
+    }
+    bar.classList.remove('mobile-file-picker-hidden');
+
+    const currentValue = select.value;
+    select.innerHTML = '';
+    for (let i = 0; i < files.length; i++) {
+      const opt = document.createElement('option');
+      opt.value = files[i].path;
+      opt.textContent = files[i].path;
+      select.appendChild(opt);
+    }
+
+    if (currentValue && files.some(function(f) { return f.path === currentValue; })) {
+      select.value = currentValue;
+    }
+
+    if (!select._mobilePickerBound) {
+      select._mobilePickerBound = true;
+      select.addEventListener('change', function() {
+        const sectionEl = document.getElementById('file-section-' + select.value);
+        if (sectionEl) {
+          sectionEl.scrollIntoView({ block: 'start', behavior: 'smooth' });
+        }
+      });
+    }
   }
 
   function buildReviewConversationTreeRow() {
@@ -1902,7 +1964,7 @@
     header.innerHTML =
       '<div class="file-header-chevron"><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M12.78 5.22a.749.749 0 0 1 0 1.06l-4.25 4.25a.749.749 0 0 1-1.06 0L3.22 6.28a.749.749 0 1 1 1.06-1.06L8 8.939l3.72-3.719a.749.749 0 0 1 1.06 0Z"/></svg></div>' +
       '<svg class="file-header-icon" viewBox="0 0 16 16" fill="var(--crit-editor-fg-muted)"><path fill-rule="evenodd" d="M3.75 1.5a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25V6H9.75A1.75 1.75 0 0 1 8 4.25V1.5H3.75zm5.75.56v2.19c0 .138.112.25.25.25h2.19L9.5 2.06zM2 1.75C2 .784 2.784 0 3.75 0h5.086c.464 0 .909.184 1.237.513l3.414 3.414c.329.328.513.773.513 1.237v8.086A1.75 1.75 0 0 1 12.25 15h-8.5A1.75 1.75 0 0 1 2 13.25V1.75z"/></svg>' +
-      '<span class="file-header-name"><span class="dir">' + escapeHtml(dirPath) + '</span>' + escapeHtml(fileName) +
+      '<span class="file-header-name"><span class="dir">' + escapeHtml(dirPath) + '</span><span class="filename">' + escapeHtml(fileName) + '</span>' +
         '<button type="button" class="file-header-copy-path" aria-label="Copy file path">' + ICON_COPY_PATH + '</button>' +
       '</span>' +
       (showBadge ? '<span class="file-header-badge ' + escapeHtml(file.status) + '">' + escapeHtml(badgeLabel) + '</span>' : '') +
@@ -2639,23 +2701,55 @@
       const ln = parseInt(this.dataset.lineNum);
       const s = this.dataset.side || '';
       const vi = this.dataset.visualIdx !== undefined ? parseInt(this.dataset.visualIdx) : undefined;
-
-      diffDragState = { filePath: fp, side: s, anchorLine: ln, currentLine: ln, anchorVisualIdx: vi, currentVisualIdx: vi };
-      activeFilePath = fp;
-      selectionStart = ln;
-      selectionEnd = ln;
-      if (diffMode !== 'split' && vi !== undefined) {
-        unifiedVisualStart = vi;
-        unifiedVisualEnd = vi;
-      }
-      renderFileByPath(fp);
-
-      document.body.classList.add('dragging');
+      beginDiffCommentDrag(fp, ln, s, vi);
       document.addEventListener('mousemove', handleDiffDragMove);
       document.addEventListener('mouseup', handleDiffDragEnd);
     });
     col.appendChild(btn);
     return col;
+  }
+
+  // Shared drag-init used by both the desktop mousedown handler on
+  // .diff-comment-btn and the touch pointerdown handler on .diff-gutter-num
+  // (added in attachDiffTouchHandler below for F4 mobile reliability).
+  function beginDiffCommentDrag(fp, ln, s, vi) {
+    diffDragState = { filePath: fp, side: s, anchorLine: ln, currentLine: ln, anchorVisualIdx: vi, currentVisualIdx: vi };
+    activeFilePath = fp;
+    selectionStart = ln;
+    selectionEnd = ln;
+    if (diffMode !== 'split' && vi !== undefined) {
+      unifiedVisualStart = vi;
+      unifiedVisualEnd = vi;
+    }
+    renderFileByPath(fp);
+    document.body.classList.add('dragging');
+  }
+
+  // F4: on touch devices, the desktop .diff-comment-btn affordance is
+  // invisible (no hover ever fires) and the user instead sees the `+`
+  // prefix that F3 puts on .diff-gutter-num. Make .diff-gutter-num itself
+  // a touch-tap target by delegating pointerdown on the diff container.
+  // The button's data attrs are co-located on the sibling .diff-comment-btn
+  // inside the same row's .diff-comment-gutter.
+  function attachDiffTouchHandler(container) {
+    container.addEventListener('pointerdown', function(e) {
+      if (e.pointerType !== 'touch') return;
+      const num = e.target.closest('.diff-gutter-num');
+      if (!num) return;
+      const row = num.closest('.diff-line, .diff-split-side');
+      if (!row) return;
+      const btn = row.querySelector('.diff-comment-btn');
+      if (!btn) return; // line not commentable
+      e.preventDefault();
+      e.stopPropagation();
+      const fp = btn.dataset.filePath;
+      const ln = parseInt(btn.dataset.lineNum);
+      const s = btn.dataset.side || '';
+      const vi = btn.dataset.visualIdx !== undefined ? parseInt(btn.dataset.visualIdx) : undefined;
+      beginDiffCommentDrag(fp, ln, s, vi);
+      document.addEventListener('pointermove', handleDiffDragMove);
+      document.addEventListener('pointerup', handleDiffDragEnd);
+    });
   }
 
   function handleDiffDragMove(e) {
@@ -2688,8 +2782,14 @@
   }
 
   function handleDiffDragEnd() {
+    // Remove both mouse and pointer listeners — desktop attaches mouse
+    // listeners via the .diff-comment-btn mousedown handler, touch
+    // attaches pointer listeners via attachDiffTouchHandler. Cleaning
+    // both is safe (removeEventListener is a no-op if not attached).
     document.removeEventListener('mousemove', handleDiffDragMove);
     document.removeEventListener('mouseup', handleDiffDragEnd);
+    document.removeEventListener('pointermove', handleDiffDragMove);
+    document.removeEventListener('pointerup', handleDiffDragEnd);
     document.body.classList.remove('dragging');
 
     if (!diffDragState) return;
@@ -3144,6 +3244,7 @@
   function renderDiffUnified(file) {
     const container = document.createElement('div');
     container.className = 'diff-container unified';
+    attachDiffTouchHandler(container);
 
     expandHunksForComments(file);
 
@@ -3272,6 +3373,7 @@
   function renderDiffSplit(file) {
     const container = document.createElement('div');
     container.className = 'diff-container split';
+    attachDiffTouchHandler(container);
 
     expandHunksForComments(file);
 
