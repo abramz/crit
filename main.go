@@ -2406,6 +2406,11 @@ func runReviewClient(entry sessionEntry, sessionKey string) (approved bool) {
 	var result struct {
 		Approved    bool   `json:"approved"`
 		NextCommand string `json:"next_command"`
+		Stats       *struct {
+			Duration int `json:"duration_seconds"`
+			Files    int `json:"files_reviewed"`
+			Comments int `json:"comments_submitted"`
+		} `json:"stats"`
 	}
 	if json.Unmarshal(body, &result) == nil {
 		// Print the exact command for the next round so the agent can
@@ -2415,9 +2420,31 @@ func runReviewClient(entry sessionEntry, sessionKey string) (approved bool) {
 		if !result.Approved && result.NextCommand != "" {
 			fmt.Fprintf(os.Stdout, "\nNext round: %s\n", result.NextCommand)
 		}
+		if result.Approved && result.Stats != nil {
+			printSessionSummary(result.Stats)
+		}
 		return result.Approved
 	}
 	return false
+}
+
+func printSessionSummary(s *struct {
+	Duration int `json:"duration_seconds"`
+	Files    int `json:"files_reviewed"`
+	Comments int `json:"comments_submitted"`
+}) {
+	if s.Files == 0 && s.Comments == 0 {
+		return
+	}
+	var parts []string
+	if s.Files > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s", s.Files, pluralize(s.Files, "file", "files")))
+	}
+	if s.Comments > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s", s.Comments, pluralize(s.Comments, "comment", "comments")))
+	}
+	parts = append(parts, formatDuration(s.Duration))
+	fmt.Fprintf(os.Stderr, "\nDone reviewing — %s\n", strings.Join(parts, " · "))
 }
 
 // dirArgs returns the subset of paths that are directories.
