@@ -1,6 +1,18 @@
 import { expect, type Page, type APIRequestContext } from '@playwright/test';
+import * as path from 'path';
 
-// Clear all comments across all files via the bulk DELETE endpoint.
+// Return the on-disk review.json path for the running e2e daemon.
+export async function getReviewFilePath(request: APIRequestContext): Promise<string> {
+  const config = await request.get('/api/config').then(r => r.json());
+  const reviewPath = config.review_path as string;
+  expect(reviewPath).toBeTruthy();
+  // review_path is the v4 identity folder; review.json lives inside it.
+  const filePath = reviewPath.endsWith('review.json')
+    ? reviewPath
+    : path.join(reviewPath, 'review.json');
+  expect(filePath).toMatch(/review\.json$/);
+  return filePath;
+}
 export async function clearAllComments(request: APIRequestContext) {
   await request.delete('/api/comments');
 }
