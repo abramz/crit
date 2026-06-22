@@ -458,20 +458,12 @@ func (s *Session) buildFilesForWorkingTree(v vcs.VCS, repoRoot string) ([]*FileE
 	}
 	s.mu.RLock()
 	ignorePatterns := s.IgnorePatterns
-	branch := s.Branch
 	s.mu.RUnlock()
-	defaultBranch := v.DefaultBranch()
-	baseRef := ""
-	if branch != defaultBranch {
-		baseRef, _ = v.MergeBase(defaultBranch)
+	baseRef, err := s.baseRefForWorkingTreeDiscovery(v)
+	if err != nil {
+		return nil, "", err
 	}
-	var changes []vcs.FileChange
-	var err error
-	if branch == defaultBranch {
-		changes, err = v.ChangedFilesOnDefaultInDir(repoRoot)
-	} else {
-		changes, err = v.ChangedFilesFromBaseInDir(baseRef, repoRoot)
-	}
+	changes, err := changedFilesForSession(v, baseRef, repoRoot)
 	if err != nil {
 		return nil, "", err
 	}

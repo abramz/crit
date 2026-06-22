@@ -548,6 +548,54 @@ func DetectVCSChanges(vc vcs.VCS, root string, ignorePatterns []string) (branch,
 	return branch, baseRef, resolvedBase, changes, nil
 }
 
+// resolveSessionStartBaseRef pins BaseRef to HEAD when reviewing on the default
+// branch. Without this, committing during a multi-round review clears the file
+// list on round-complete because ChangedFilesOnDefaultInDir only diffs the
+// working tree against the current HEAD.
+func resolveSessionStartBaseRef(v vcs.VCS, branch, resolvedBase, baseRef, repoRoot string) (string, error) {
+	if baseRef != "" || branch != resolvedBase {
+		return baseRef, nil
+	}
+	if v == nil || v.Name() != "git" {
+		return baseRef, nil
+	}
+	sha, err := vcs.HeadSHAInDir(repoRoot)
+	if err != nil {
+		return "", fmt.Errorf("resolving session start HEAD: %w", err)
+	}
+	return sha, nil
+}
+
+// changedFilesForSession returns changed files for git-mode refresh. When
+// BaseRef is set (feature-branch merge-base or default-branch session start),
+// diffs from that ref to the working tree; otherwise falls back to working-tree-only.
+func changedFilesForSession(v vcs.VCS, baseRef, repoRoot string) ([]vcs.FileChange, error) {
+	if baseRef != "" {
+		return v.ChangedFilesFromBaseInDir(baseRef, repoRoot)
+	}
+	return v.ChangedFilesOnDefaultInDir(repoRoot)
+}
+
+// baseRefForWorkingTreeDiscovery returns the diff base for rebuilding the
+// working-tree file list. On a feature branch this is always the merge-base
+// with the default branch (not the session's current BaseRef, which may still
+// hold a range-focus SHA). On the default branch it uses the session-pinned
+// start HEAD when set.
+func (s *Session) baseRefForWorkingTreeDiscovery(v vcs.VCS) (string, error) {
+	s.mu.RLock()
+	sessionBase := s.BaseRef
+	branch := s.Branch
+	s.mu.RUnlock()
+
+	if branch != v.DefaultBranch() {
+		return v.MergeBase(v.DefaultBaseRef())
+	}
+	if sessionBase != "" {
+		return sessionBase, nil
+	}
+	return "", nil
+}
+
 // NewGitSession creates a session by auto-detecting changed files using the given VCS backend.
 // This is the VCS-agnostic equivalent of NewSessionFromGit.
 func NewGitSession(v vcs.VCS, ignorePatterns []string) (*Session, error) {
@@ -582,6 +630,11 @@ func newGitSession(v vcs.VCS, ignorePatterns []string, requireChanges bool) (*Se
 		}
 		err = nil
 	}
+	if err != nil {
+		return nil, err
+	}
+
+	baseRef, err = resolveSessionStartBaseRef(v, branch, resolvedBase, baseRef, root)
 	if err != nil {
 		return nil, err
 	}
